@@ -1070,6 +1070,11 @@ def main() -> None:
         with logfile.open("a", encoding="utf-8") as f:
             print(msg, file=f)
 
+    metrics_file = out_dir / f"{args.run_id}_metrics.jsonl"
+    def jlog(d: dict) -> None:
+        with metrics_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(d) + "\n")
+
     _exit_reason = "unknown"
 
     def _on_exit():
@@ -1286,6 +1291,7 @@ def main() -> None:
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
+            jlog({"step": step, "val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": train_time_ms})
             if val_bpb < best_val_bpb and step > 0:
                 best_val_bpb = val_bpb
                 best_ckpt_path = out_dir / f"{args.run_id}_best.npz"
@@ -1347,6 +1353,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+            jlog({"step": step, "train_loss": train_loss_value, "lr_mul": lr_mul,
+                  "step_ms": step_ms, "tok_s": tok_s, "train_time_ms": approx_train_time_ms})
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
@@ -1408,6 +1416,26 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Structured run summary for post-run analysis
+    summary = {
+        "run_id": args.run_id,
+        "val_loss": q_val_loss,
+        "val_bpb": q_val_bpb,
+        "quant_file_bytes": quant_file_bytes,
+        "score": q_val_bpb * quant_file_bytes / (1024 * 1024),
+        "model_file_bytes": int(out_path.stat().st_size),
+        "n_params": n_params,
+        "train_time_ms": train_time_ms,
+        "steps": step,
+        "compressor": _COMPRESSOR,
+        "config": {k: getattr(args, k) for k in Hyperparameters.__annotations__},
+    }
+    summary_path = out_dir / f"{args.run_id}_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=str)
+    log(f"summary:{summary_path} score:{summary['score']:.4f}")
+
     _exit_reason = "clean"
 
 
