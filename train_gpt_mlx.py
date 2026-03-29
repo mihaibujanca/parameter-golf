@@ -102,7 +102,7 @@ class Hyperparameters:
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
-    adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
+    adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-10))
     tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
     matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
@@ -114,6 +114,7 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     muon_wd: float = float(os.environ.get("MUON_WD", 0.04))
     adam_wd: float = float(os.environ.get("ADAM_WD", 0.01))
+    cautious_wd: bool = bool(int(os.environ.get("CAUTIOUS_WD", "1")))
 
     # BigramHash embedding
     bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
@@ -625,7 +626,12 @@ class Muon:
                 g_ortho = g_ortho / row_norms
             scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
             if self.args.muon_wd > 0:
-                p = p * (1.0 - lr * self.args.muon_wd)
+                if self.args.cautious_wd:
+                    # Cautious WD: only decay where gradient and param agree in sign
+                    mask = (g * p > 0).astype(p.dtype)
+                    p = p * (1.0 - lr * self.args.muon_wd * mask)
+                else:
+                    p = p * (1.0 - lr * self.args.muon_wd)
             out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
         return out
 

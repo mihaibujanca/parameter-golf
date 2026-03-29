@@ -94,8 +94,11 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    adam_eps = float(os.environ.get("ADAM_EPS", 1e-10))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.01))
+    cautious_wd = bool(int(os.environ.get("CAUTIOUS_WD", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -121,10 +124,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 nesterov: bool = True, weight_decay: float = 0.0, cautious_wd: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov,
+                 weight_decay=weight_decay, cautious_wd=cautious_wd),
         )
 
     @torch.no_grad()
@@ -170,9 +175,18 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group["weight_decay"]
+            cautious = group["cautious_wd"]
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if wd > 0:
+                    if cautious and p.grad is not None:
+                        # Cautious WD: only decay where gradient and param agree in sign
+                        mask = (p.grad * p.data > 0).float()
+                        p.data.mul_(1 - lr * wd * mask)
+                    else:
+                        p.data.mul_(1 - lr * wd)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -928,6 +942,8 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
+        cautious_wd=args.cautious_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1084,6 +1100,19 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        # Cautious WD for Adam params (applied before step since Adam has no built-in WD)
+        if args.adam_wd > 0:
+            adam_opts = [o for o in optimizers if not isinstance(o, Muon)]
+            for opt in adam_opts:
+                for group in opt.param_groups:
+                    for p in group["params"]:
+                        if p.grad is None:
+                            continue
+                        if args.cautious_wd:
+                            mask = (p.grad * p.data > 0).float()
+                            p.data.mul_(1 - group["lr"] * args.adam_wd * mask)
+                        else:
+                            p.data.mul_(1 - group["lr"] * args.adam_wd)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
