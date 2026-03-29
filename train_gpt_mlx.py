@@ -90,11 +90,12 @@ class Hyperparameters:
     # Per-layer MLP mult override, comma-separated (e.g. "3,3,3,3,3,3,3,2,2" for 9 layers).
     # Empty string = use uniform mlp_mult for all layers.
     mlp_mult_per_layer: str = os.environ.get("MLP_MULT_PER_LAYER", "")
-    mlp_act: str = os.environ.get("MLP_ACT", "relu2")  # "relu2" or "swiglu"
+    mlp_act: str = os.environ.get("MLP_ACT", "relu2")  # "relu2", "lrelu2", or "swiglu"
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_temp: float = float(os.environ.get("LOGIT_TEMP", 1.0))  # Temperature scaling: T<1 sharpens, T>1 smooths
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -125,6 +126,13 @@ class Hyperparameters:
 
     # Bad batch detection: skip optimizer step if loss > threshold * EMA(loss)
     loss_skip_threshold: float = float(os.environ.get("LOSS_SKIP_THRESHOLD", 1.5))
+
+    # Periodic checkpoint saving (0 = disabled, only best-val checkpoint).
+    checkpoint_every: int = int(os.environ.get("CHECKPOINT_EVERY", 0))
+
+    # Post-training quantization bit-widths (4, 5, 6, or 8).
+    quant_attn_bits: int = int(os.environ.get("QUANT_ATTN_BITS", "6"))
+    quant_mlp_bits: int = int(os.environ.get("QUANT_MLP_BITS", "6"))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -415,8 +423,12 @@ class MLP(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         if self.act == "swiglu":
             return self.proj(nn.silu(self.gate(x)) * self.fc(x))
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        h = self.fc(x)
+        if self.act == "lrelu2":
+            h = nn.leaky_relu(h, negative_slope=0.5)
+        else:
+            h = nn.relu(h)
+        return self.proj(h * h)
 
 
 class SmearGate(nn.Module):
@@ -479,12 +491,13 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, mlp_act: str = "relu2", mlp_mult_per_layer: list[int] | None = None,
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.logit_temp = logit_temp
         self.num_layers = num_layers
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
@@ -550,22 +563,26 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
+    def _apply_logit_processing(self, logits: mx.array) -> mx.array:
+        logits = self.softcap(logits)
+        if self.logit_temp != 1.0:
+            logits = logits / self.logit_temp
+        return logits
+
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
             return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self._apply_logit_processing(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
 
@@ -573,7 +590,7 @@ class GPT(nn.Module):
         """Like loss() but scores only the last n tokens of each sequence. Used for sliding window eval."""
         x = self(input_ids)[:, -n:, :].reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids[:, -n:].reshape(-1)
-        logits = self.softcap(x @ self.tok_emb.weight.astype(x.dtype).T)
+        logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
         return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
 # ==============================================================================
@@ -738,6 +755,37 @@ def quantize_int6_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(q), scale
 
 
+def quantize_int5_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize to int5 range [-16, 15] stored as int8."""
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        row_max = np.abs(f32).max(axis=1)
+        scale = np.maximum(row_max / 15.0, 1e-12).astype(np.float16)
+        q = np.clip(np.round(f32 / scale.astype(np.float32)[:, None]), -16, 15).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+    amax = float(np.abs(f32).max()) if f32.size else 0.0
+    scale = np.array(max(amax / 15.0, 1e-12), dtype=np.float16)
+    q = np.clip(np.round(f32 / float(scale)), -16, 15).astype(np.int8)
+    return np.ascontiguousarray(q), scale
+
+
+def quantize_int4_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize to int4 range [-8, 7] stored as int8."""
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        row_max = np.abs(f32).max(axis=1)
+        scale = np.maximum(row_max / 7.0, 1e-12).astype(np.float16)
+        q = np.clip(np.round(f32 / scale.astype(np.float32)[:, None]), -8, 7).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+    amax = float(np.abs(f32).max()) if f32.size else 0.0
+    scale = np.array(max(amax / 7.0, 1e-12), dtype=np.float16)
+    q = np.clip(np.round(f32 / float(scale)), -8, 7).astype(np.int8)
+    return np.ascontiguousarray(q), scale
+
+
+_QUANT_FN = {4: quantize_int4_per_row, 5: quantize_int5_per_row, 6: quantize_int6_per_row, 8: quantize_float_array}
+
+
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
@@ -753,7 +801,8 @@ def _classify_param(name: str) -> str:
 FP16_KEEP_NAME_PATTERNS = ("tok_emb",)
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str] = frozenset({"mlp", "attn"})) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str] = frozenset({"mlp", "attn"}),
+                              cat_bits: dict[str, int] | None = None) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -794,13 +843,15 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str
 
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
-        if cat in int6_cats and arr.ndim >= 1:
-            q, s = quantize_int6_per_row(arr)
-            qmeta[name] = {"scheme": "int6_per_row", "axis": 0}
-        else:
-            q, s = quantize_float_array(arr)
-            if s.ndim > 0:
-                qmeta[name] = {"scheme": "per_row", "axis": 0}
+        bits = (cat_bits or {}).get(cat)
+        if bits is None:
+            bits = 6 if cat in int6_cats else 8
+        quant_fn = _QUANT_FN[bits]
+        q, s = quant_fn(arr)
+        if bits < 8:
+            qmeta[name] = {"scheme": f"int{bits}_per_row", "axis": 0}
+        elif s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(arr.dtype).split(".")[-1]
@@ -1146,6 +1197,7 @@ def main() -> None:
         mlp_mult_per_layer=per_layer,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        logit_temp=args.logit_temp,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
@@ -1299,6 +1351,12 @@ def main() -> None:
                 mx.savez(str(best_ckpt_path), **flat_best)
                 log(f"best_ckpt:step={step} val_bpb={val_bpb:.4f} saved:{best_ckpt_path}")
             t0 = time.perf_counter()
+        # Periodic checkpoint (independent of val).
+        if args.checkpoint_every > 0 and step > 0 and step % args.checkpoint_every == 0 and not last_step:
+            ckpt_path = out_dir / f"{args.run_id}_step{step}.npz"
+            flat_ckpt = {k: v for k, v in tree_flatten(model.state)}
+            mx.savez(str(ckpt_path), **flat_ckpt)
+            log(f"periodic_ckpt:step={step} saved:{ckpt_path}")
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
@@ -1376,7 +1434,8 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    cat_bits = {"attn": args.quant_attn_bits, "mlp": args.quant_mlp_bits}
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state, cat_bits=cat_bits)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     if _COMPRESSOR == "zstd":
         cctx = zstandard.ZstdCompressor(level=22)
@@ -1384,7 +1443,8 @@ def main() -> None:
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int6.pt{_COMPRESSOR[0]}"
+    qbits_label = f"a{args.quant_attn_bits}m{args.quant_mlp_bits}" if args.quant_attn_bits != args.quant_mlp_bits else f"int{args.quant_attn_bits}"
+    quant_path = out_dir / f"{args.run_id}_mlx_model.{qbits_label}.pt{_COMPRESSOR[0]}"
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size

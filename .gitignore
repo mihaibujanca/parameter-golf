@@ -9,3 +9,19 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+
+# Local research notes (not for upstream)
+AGENDA.md
+CLAUDE.md
+NEXT_STEPS.md
+PR_DEEP_DIVE.md
+QAT_TRANSFER_IDEAS.md
+SOCIAL_DYNAMICS*.md
+proposed_research_directions.md
+H100_ANALYSIS_PLAN.md
+papers/
+.claude/
+memory/
+analyze_*.py
+run_experiments.sh
+run_layer_scaling.sh

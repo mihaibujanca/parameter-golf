@@ -17,6 +17,11 @@ import sys
 import time
 import uuid
 import zlib
+try:
+    import zstandard
+    _COMPRESSOR = "zstd"
+except ImportError:
+    _COMPRESSOR = "zlib"
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +74,12 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_temp = float(os.environ.get("LOGIT_TEMP", 1.0))
+    mlp_act = os.environ.get("MLP_ACT", "relu2")  # "relu2" or "lrelu2"
+
+    # Post-training quantization bit-widths (4, 5, 6, or 8).
+    quant_attn_bits = int(os.environ.get("QUANT_ATTN_BITS", "6"))
+    quant_mlp_bits = int(os.environ.get("QUANT_MLP_BITS", "6"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -339,7 +350,32 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_intN_per_row(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
+    """Quantize to intN range stored as int8. Per-row fp16 scales."""
+    max_val = (1 << (bits - 1)) - 1  # e.g., 31 for int6, 15 for int5, 7 for int4
+    t32 = t.float()
+    if t32.ndim == 2:
+        row_max = t32.abs().amax(dim=1)
+        scale = (row_max / max_val).clamp_min(1e-12).to(dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
+        return q, scale.contiguous()
+    amax = float(t32.abs().max().item()) if t32.numel() else 0.0
+    scale = torch.tensor(max(amax / max_val, 1e-12), dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -max_val - 1, max_val).to(torch.int8).contiguous()
+    return q, scale
+
+
+def _classify_param(name: str) -> str:
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".mlp." in name:
+        return "mlp"
+    if ".attn." in name or ".attn_" in name:
+        return "attn"
+    return "other"
+
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], cat_bits: dict[str, int] | None = None):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -377,9 +413,15 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        cat = _classify_param(name)
+        bits = (cat_bits or {}).get(cat, 8)
+        if bits < 8:
+            q, s = quantize_intN_per_row(t, bits)
+            qmeta[name] = {"scheme": f"int{bits}_per_row", "axis": 0}
+        else:
+            q, s = quantize_float_tensor(t)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -604,17 +646,21 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, act: str = "relu2"):
         super().__init__()
+        self.act = act
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        h = self.fc(x)
+        if self.act == "lrelu2":
+            h = F.leaky_relu(h, negative_slope=0.5)
+        else:
+            h = torch.relu(h)
+        return self.proj(h.square())
 
 
 class Block(nn.Module):
@@ -626,12 +672,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_act: str = "relu2",
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, act=mlp_act)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +706,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mlp_act: str = "relu2",
+        logit_temp: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +715,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.logit_temp = logit_temp
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +730,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mlp_act=mlp_act,
                 )
                 for i in range(num_layers)
             ]
@@ -721,6 +772,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if self.logit_temp != 1.0:
+            logits = logits / self.logit_temp
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -835,6 +888,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mlp_act=args.mlp_act,
+        logit_temp=args.logit_temp,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1073,29 +1128,41 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    cat_bits = {"attn": args.quant_attn_bits, "mlp": args.quant_mlp_bits}
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), cat_bits=cat_bits)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if _COMPRESSOR == "zstd":
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        qbits_label = f"a{args.quant_attn_bits}m{args.quant_mlp_bits}" if args.quant_attn_bits != args.quant_mlp_bits else f"int{args.quant_attn_bits}"
+        quant_filename = f"final_model.{qbits_label}.pt{_COMPRESSOR[0]}"
+        with open(quant_filename, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(quant_filename)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {qbits_label}+{_COMPRESSOR}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes ({(quant_file_bytes + code_bytes) / 1024 / 1024:.2f} MB)")
+    else:
+        qbits_label = f"a{args.quant_attn_bits}m{args.quant_mlp_bits}" if args.quant_attn_bits != args.quant_mlp_bits else f"int{args.quant_attn_bits}"
+        quant_filename = f"final_model.{qbits_label}.pt{_COMPRESSOR[0]}"
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(quant_filename, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    if _COMPRESSOR == "zstd":
+        quant_state = torch.load(io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
+    else:
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1113,10 +1180,11 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"score:{q_val_bpb * quant_file_bytes / (1024 * 1024):.4f}")
 
     if distributed:
         dist.destroy_process_group()
