@@ -90,7 +90,8 @@ class Hyperparameters:
     # Per-layer MLP mult override, comma-separated (e.g. "3,3,3,3,3,3,3,2,2" for 9 layers).
     # Empty string = use uniform mlp_mult for all layers.
     mlp_mult_per_layer: str = os.environ.get("MLP_MULT_PER_LAYER", "")
-    mlp_act: str = os.environ.get("MLP_ACT", "relu2")  # "relu2", "lrelu2", or "swiglu"
+    mlp_act: str = os.environ.get("MLP_ACT", "relu2")  # "relu2", "lrelu2", "sugar", or "swiglu"
+    lrelu_slope: float = float(os.environ.get("LRELU_SLOPE", 0.5))  # negative slope for lrelu2/sugar
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -421,12 +422,17 @@ class MLP(nn.Module):
             self.fc = CastedLinear(dim, hidden)
             self.proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, slope: float = 0.5) -> mx.array:
         if self.act == "swiglu":
             return self.proj(nn.silu(self.gate(x)) * self.fc(x))
         h = self.fc(x)
         if self.act == "lrelu2":
-            h = nn.leaky_relu(h, negative_slope=0.5)
+            h = nn.leaky_relu(h, negative_slope=slope)
+        elif self.act == "sugar":
+            # SUGAR: forward uses hard ReLU, backward uses leaky ReLU gradient
+            soft = nn.leaky_relu(h, negative_slope=slope)
+            hard = nn.relu(h)
+            h = soft + mx.stop_gradient(hard - soft)
         else:
             h = nn.relu(h)
         return self.proj(h * h)
@@ -469,12 +475,14 @@ class BigramHashEmbedding(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, mlp_act: str = "relu2"):
+                 rope_base: float, qk_gain_init: float, mlp_act: str = "relu2",
+                 lrelu_slope: float = 0.5):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult, act=mlp_act)
+        self.lrelu_slope = lrelu_slope
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -484,7 +492,7 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), slope=self.lrelu_slope)
         return x
 
 
@@ -492,7 +500,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, mlp_act: str = "relu2", mlp_mult_per_layer: list[int] | None = None,
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0,
+                 lrelu_slope: float = 0.5):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -511,7 +520,7 @@ class GPT(nn.Module):
         self.blocks = [
             Block(dim, num_heads, num_kv_heads,
                   mlp_mult_per_layer[i] if mlp_mult_per_layer else mlp_mult,
-                  rope_base, qk_gain_init, mlp_act=mlp_act)
+                  rope_base, qk_gain_init, mlp_act=mlp_act, lrelu_slope=lrelu_slope)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -1204,6 +1213,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         logit_temp=args.logit_temp,
+        lrelu_slope=args.lrelu_slope,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
@@ -1433,6 +1443,21 @@ def main() -> None:
         model.update(tree_unflatten(list(swa_flat.items())))
 
     # ==============================================================================
+    # PRE-QUANT EVAL (of the actual model that will be quantized, incl. SWA)
+    # ==============================================================================
+    pre_val_loss, pre_val_bpb = eval_val(
+        args,
+        compiled_loss,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        log_fn=log,
+        compiled_sliding_loss=compiled_sliding_loss,
+    )
+    log(f"pre_quant val_loss:{pre_val_loss:.4f} val_bpb:{pre_val_bpb:.4f}")
+
+    # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
@@ -1483,11 +1508,28 @@ def main() -> None:
     log(f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # Structured run summary for post-run analysis
+    # Structured run summary for post-run analysis.
+    # Schema:
+    #   val_loss_pre_quant  float  Val CE before quantization (eval of SWA/final model)
+    #   val_bpb_pre_quant   float  Val BPB before quantization
+    #   val_loss            float  Val CE after quantize→dequantize roundtrip
+    #   val_bpb             float  Val BPB after quantize→dequantize roundtrip
+    #   quant_gap_bpb       float  val_bpb - val_bpb_pre_quant (quantization cost)
+    #   quant_file_bytes    int    Compressed artifact size in bytes
+    #   score               float  val_bpb * artifact_MB (local tracking, NOT competition metric)
+    #   model_file_bytes    int    Raw uncompressed .npz size
+    #   n_params            int    Total trainable parameters
+    #   train_time_ms       float  Wall-clock training time
+    #   steps               int    Training steps completed
+    #   compressor          str    "zstd" or "zlib"
+    #   config              dict   Full Hyperparameters snapshot
     summary = {
         "run_id": args.run_id,
+        "val_loss_pre_quant": pre_val_loss,
+        "val_bpb_pre_quant": pre_val_bpb,
         "val_loss": q_val_loss,
         "val_bpb": q_val_bpb,
+        "quant_gap_bpb": q_val_bpb - pre_val_bpb,
         "quant_file_bytes": quant_file_bytes,
         "score": q_val_bpb * quant_file_bytes / (1024 * 1024),
         "model_file_bytes": int(out_path.stat().st_size),
