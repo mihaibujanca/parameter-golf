@@ -54,6 +54,8 @@ def main():
                         help="Save trained correction weights to this .npz path")
     parser.add_argument("--load-corrections", type=str, default=None,
                         help="Load pre-trained correction weights instead of training")
+    parser.add_argument("--no-permute", action="store_true",
+                        help="Skip weight permutation (for comparison)")
     parser.add_argument("--compressor", choices=["brotli", "zstd"], default="brotli")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated)")
@@ -119,6 +121,12 @@ def main():
 
     log.info("Quantizing...")
     qobj, _ = quantize_state_dict_int8(flat, cat_bits=cat_bits)
+
+    # Weight permutation for better compression (lossless)
+    if not args.no_permute:
+        from scripts.weight_permutation import permute_mlp_qobj
+        log.info("Permuting MLP weights for compression...")
+        permute_mlp_qobj(qobj)
 
     # Train or load corrections
     correction_arrays = {}
@@ -189,7 +197,30 @@ def main():
                 log.info(f"Saved corrections to {args.save_corrections}")
 
         total_corr_params = sum(v.size for v in correction_arrays.values() if v.dtype != np.int64)
-        log.info(f"Correction params: {total_corr_params:,}")
+        log.info(f"Correction params (f32): {total_corr_params:,}")
+
+        # Quantize correction weights to int8 for compression (skip if already int8)
+        already_quantized = any(k.endswith('.q') and v.dtype == np.int8
+                                for k, v in correction_arrays.items())
+        if already_quantized:
+            log.info("Corrections already int8-quantized, skipping re-quantization")
+        else:
+            corr_quantized = {}
+            for k, v in correction_arrays.items():
+                if k.startswith("__"):
+                    corr_quantized[k] = v
+                    continue
+                arr = v.astype(np.float32) if v.dtype != np.float32 else v
+                if arr.ndim == 2:  # weight matrix → int8 + per-row scale
+                    row_max = np.abs(arr).max(axis=1)
+                    scale = np.maximum(row_max / 127.0, 1e-12).astype(np.float16)
+                    q = np.clip(np.round(arr / scale.astype(np.float32)[:, None]), -128, 127).astype(np.int8)
+                    corr_quantized[k + ".q"] = q
+                    corr_quantized[k + ".s"] = scale
+                else:  # bias → fp16
+                    corr_quantized[k] = arr.astype(np.float16)
+            correction_arrays = corr_quantized
+            log.info("Correction quantized to int8")
 
     # Bundle into single artifact
     artifact = dict(qobj)

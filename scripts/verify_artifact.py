@@ -67,14 +67,22 @@ def extract_corrections(artifact: dict, dim: int):
         b_key = f'correction.{li}.linear.bias'
 
         # Handle int8-quantized corrections (.q + .s) or raw float
-        if f'{w_key}.q' in artifact:
+        if f'{w_key}.q.q' in artifact:
+            # Double-quantized (legacy bug): .q.q is the int8, .q.s is scale
+            q = artifact[f'{w_key}.q.q'].astype(np.float32)
+            s = artifact[f'{w_key}.q.s'].astype(np.float32)
+            w = q * s[:, None]
+            b = artifact[b_key].astype(np.float32)
+        elif f'{w_key}.q' in artifact and artifact[f'{w_key}.q'].dtype == np.int8:
             q = artifact[f'{w_key}.q'].astype(np.float32)
             s = artifact[f'{w_key}.s'].astype(np.float32)
             w = q * s[:, None]
             b = artifact[b_key].astype(np.float32)
-        else:
+        elif w_key in artifact:
             w = artifact[w_key].astype(np.float32)
             b = artifact[b_key].astype(np.float32)
+        else:
+            raise KeyError(f"Cannot find correction weights for layer {li}: tried {w_key}, {w_key}.q, {w_key}.q.q")
 
         net.linear.weight = mx.array(w)
         net.linear.bias = mx.array(b)

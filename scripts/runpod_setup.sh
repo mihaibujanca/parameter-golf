@@ -22,17 +22,29 @@ else
     git pull
 fi
 
-# Download data if not present
-if [ ! -d /workspace/parameter-golf/data/datasets/fineweb10B_sp1024 ]; then
+# Data strategy: network volume for persistence, local SSD for training speed
+LOCAL_DATA="data/datasets/fineweb10B_sp1024"
+VOLUME_DATA="/runpod-volume/data/datasets/fineweb10B_sp1024"
+
+if [ -d "$LOCAL_DATA" ] && [ "$(ls $LOCAL_DATA/*.bin 2>/dev/null | wc -l)" -gt 0 ]; then
+    echo "Data already on local SSD"
+elif [ -d "$VOLUME_DATA" ] && [ "$(ls $VOLUME_DATA/*.bin 2>/dev/null | wc -l)" -gt 0 ]; then
+    echo "Copying data from network volume to local SSD..."
+    mkdir -p data/datasets
+    time cp -r "$VOLUME_DATA" "$LOCAL_DATA"
+    echo "Done (local copy, fast)"
+else
     echo "Downloading FineWeb data..."
     python3 data/cached_challenge_fineweb.py --variant sp1024
-else
-    echo "Data already present"
-    ls -la data/datasets/fineweb10B_sp1024/ | head -5
-    echo "..."
-    ls data/datasets/fineweb10B_sp1024/*.bin | wc -l
-    echo "shards total"
+    # Cache to network volume if available
+    if [ -d "/runpod-volume" ]; then
+        echo "Caching to network volume for future pods..."
+        mkdir -p /runpod-volume/data/datasets
+        cp -r "$LOCAL_DATA" "$VOLUME_DATA"
+    fi
 fi
+
+echo "Data: $(ls $LOCAL_DATA/*.bin 2>/dev/null | wc -l) shards"
 
 # Install any missing deps
 echo "Checking dependencies..."
