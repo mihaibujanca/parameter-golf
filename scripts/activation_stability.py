@@ -28,7 +28,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
     GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
-    build_sentencepiece_luts, validate_dataset_tokenizer_pair,
+    build_sentencepiece_luts, validate_dataset_tokenizer_pair, rms_norm,
 )
 
 
@@ -46,13 +46,23 @@ def collect_mlp_preacts(model, tokens, seq_len=1024, max_seqs=64):
         x = mx.array(x_np[np.newaxis, :])  # (1, seq_len)
 
         # Manual forward to capture pre-activations
-        tok_emb = model.tok_emb(x)
+        tok_emb = model.tok_emb(x).astype(COMPUTE_DTYPE)
         if model.bigram is not None:
             tok_emb = tok_emb + model.bigram(x)
-        x0 = model.smear(tok_emb)
+        x0 = model.smear(rms_norm(tok_emb))
         h = x0
 
+        n_enc = model.num_encoder_layers
+        n_skip = model.num_skip_weights
+        encoder_outputs = []
+
         for i, block in enumerate(model.blocks):
+            if i >= n_enc and (i - n_enc) < n_skip:
+                skip_idx = n_enc - 1 - (i - n_enc)
+                skip_h = encoder_outputs[skip_idx]
+                w = model.skip_weights[i - n_enc]
+                h = h + w.astype(h.dtype)[None, None, :] * skip_h
+
             mix = block.resid_mix.astype(h.dtype)
             h = mix[0][None, None, :] * h + mix[1][None, None, :] * x0
             attn_out = block.attn(block.attn_norm(h))
@@ -64,6 +74,9 @@ def collect_mlp_preacts(model, tokens, seq_len=1024, max_seqs=64):
             preacts_per_layer[i].append(np.array(pre_act))
             # Continue normal forward for residual
             h = h + block.mlp_scale.astype(h.dtype)[None, None, :] * block.mlp(mlp_input, slope=block.lrelu_slope)
+
+            if i < n_enc:
+                encoder_outputs.append(h)
 
     # Concatenate across sequences
     return {i: np.concatenate(v, axis=1) for i, v in preacts_per_layer.items()}  # (1, total_tokens, hidden)
@@ -135,6 +148,8 @@ def main():
         bigram_dim=hparams.bigram_dim,
         logit_temp=hparams.logit_temp,
         lrelu_slope=hparams.lrelu_slope,
+        xsa_last_n=hparams.xsa_last_n,
+        rope_dims=hparams.rope_dims,
     )
 
     # Load checkpoint

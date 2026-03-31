@@ -86,7 +86,7 @@ class Hyperparameters:
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: float = float(os.environ.get("MLP_MULT", 2))
     # Per-layer MLP mult override, comma-separated (e.g. "3,3,3,3,3,3,3,2,2" for 9 layers).
     # Empty string = use uniform mlp_mult for all layers.
     mlp_mult_per_layer: str = os.environ.get("MLP_MULT_PER_LAYER", "")
@@ -98,6 +98,7 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_temp: float = float(os.environ.get("LOGIT_TEMP", 1.0))  # Temperature scaling: T<1 sharpens, T>1 smooths
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", "0"))  # 0 = full head_dim
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
@@ -121,10 +122,17 @@ class Hyperparameters:
     bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
 
+    # XSA (Exclusive Self Attention) — applied to last N layers (0 = disabled)
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", "0"))
+
     # Stochastic Weight Averaging
     swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.5))
     swa_every: int = int(os.environ.get("SWA_EVERY", 50))
+
+    # EMA (Exponential Moving Average)
+    ema_enabled: bool = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay: float = float(os.environ.get("EMA_DECAY", 0.997))
 
     # Bad batch detection: skip optimizer step if loss > threshold * EMA(loss)
     loss_skip_threshold: float = float(os.environ.get("LOSS_SKIP_THRESHOLD", 1.5))
@@ -371,6 +379,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -388,8 +398,12 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        # Partial RoPE: rope_dims=0 means full head_dim; MLX nn.RoPE auto-passes through extra dims
+        actual_rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        self.rope = nn.RoPE(actual_rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self.use_xsa = use_xsa
+        self.group_size = num_heads // num_kv_heads
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -401,6 +415,14 @@ class CausalSelfAttention(nn.Module):
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+
+        # XSA: project out self-value bias (arXiv:2603.09078)
+        if self.use_xsa:
+            vn = v * mx.rsqrt((v * v).sum(axis=-1, keepdims=True) + 1e-6)
+            y_g = y.reshape(bsz, self.num_kv_heads, self.group_size, seqlen, self.head_dim)
+            vn = mx.expand_dims(vn, axis=2)  # (B, Hkv, 1, T, D)
+            y = (y_g - (y_g * vn).sum(axis=-1, keepdims=True) * vn).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -418,7 +440,7 @@ class MLP(nn.Module):
             self.fc = CastedLinear(dim, hidden)
             self.proj = CastedLinear(hidden, dim)
         else:
-            hidden = dim * mlp_mult
+            hidden = int(dim * mlp_mult)
             self.fc = CastedLinear(dim, hidden)
             self.proj = CastedLinear(hidden, dim)
 
@@ -476,11 +498,12 @@ class BigramHashEmbedding(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, mlp_act: str = "relu2",
-                 lrelu_slope: float = 0.5):
+                 lrelu_slope: float = 0.5, use_xsa: bool = False, rope_dims: int = 0):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        use_xsa=use_xsa, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult, act=mlp_act)
         self.lrelu_slope = lrelu_slope
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
@@ -501,7 +524,7 @@ class GPT(nn.Module):
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, mlp_act: str = "relu2", mlp_mult_per_layer: list[int] | None = None,
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0,
-                 lrelu_slope: float = 0.5):
+                 lrelu_slope: float = 0.5, xsa_last_n: int = 0, rope_dims: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -520,7 +543,9 @@ class GPT(nn.Module):
         self.blocks = [
             Block(dim, num_heads, num_kv_heads,
                   mlp_mult_per_layer[i] if mlp_mult_per_layer else mlp_mult,
-                  rope_base, qk_gain_init, mlp_act=mlp_act, lrelu_slope=lrelu_slope)
+                  rope_base, qk_gain_init, mlp_act=mlp_act, lrelu_slope=lrelu_slope,
+                  use_xsa=(i >= num_layers - xsa_last_n) if xsa_last_n > 0 else False,
+                  rope_dims=rope_dims)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -798,12 +823,50 @@ def quantize_int4_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(q), scale
 
 
-_QUANT_FN = {4: quantize_int4_per_row, 5: quantize_int5_per_row, 6: quantize_int6_per_row, 8: quantize_float_array}
+def quantize_int3_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize to int3 range [-4, 3] stored as int8."""
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        row_max = np.abs(f32).max(axis=1)
+        scale = np.maximum(row_max / 3.0, 1e-12).astype(np.float16)
+        q = np.clip(np.round(f32 / scale.astype(np.float32)[:, None]), -4, 3).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+    amax = float(np.abs(f32).max()) if f32.size else 0.0
+    scale = np.array(max(amax / 3.0, 1e-12), dtype=np.float16)
+    q = np.clip(np.round(f32 / float(scale)), -4, 3).astype(np.int8)
+    return np.ascontiguousarray(q), scale
+
+
+def quantize_int2_per_row(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize to int2 range [-2, 1] stored as int8."""
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        row_max = np.abs(f32).max(axis=1)
+        scale = np.maximum(row_max / 1.0, 1e-12).astype(np.float16)
+        q = np.clip(np.round(f32 / scale.astype(np.float32)[:, None]), -2, 1).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+    amax = float(np.abs(f32).max()) if f32.size else 0.0
+    scale = np.array(max(amax / 1.0, 1e-12), dtype=np.float16)
+    q = np.clip(np.round(f32 / float(scale)), -2, 1).astype(np.int8)
+    return np.ascontiguousarray(q), scale
+
+
+_QUANT_FN = {2: quantize_int2_per_row, 3: quantize_int3_per_row, 4: quantize_int4_per_row, 5: quantize_int5_per_row, 6: quantize_int6_per_row, 8: quantize_float_array}
 
 
 def _classify_param(name: str) -> str:
+    """Classify parameter for quantization. Returns category string.
+
+    For per-layer bit-width overrides, also returns 'mlp.N' or 'attn.N'
+    which cat_bits can match before falling back to 'mlp' or 'attn'.
+    """
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    # Extract layer index for per-layer overrides (e.g. "blocks.12.mlp.fc.weight")
+    import re
+    m = re.search(r"blocks\.(\d+)\.(mlp|attn)\.", name)
+    if m:
+        return f"{m.group(2)}.{m.group(1)}"  # e.g. "mlp.12"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name:
@@ -858,7 +921,11 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str
 
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
+        # Per-layer override (e.g. "mlp.12") falls back to category (e.g. "mlp")
         bits = (cat_bits or {}).get(cat)
+        if bits is None:
+            base_cat = cat.split(".")[0]  # "mlp.12" -> "mlp"
+            bits = (cat_bits or {}).get(base_cat)
         if bits is None:
             bits = 6 if cat in int6_cats else 8
         quant_fn = _QUANT_FN[bits]
@@ -1214,6 +1281,8 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         logit_temp=args.logit_temp,
         lrelu_slope=args.lrelu_slope,
+        xsa_last_n=args.xsa_last_n,
+        rope_dims=args.rope_dims,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
@@ -1334,6 +1403,7 @@ def main() -> None:
     best_ckpt_path: Path | None = None
     swa_state: dict[str, np.ndarray] | None = None
     swa_count = 0
+    ema_state: dict[str, np.ndarray] | None = None
     loss_ema = 0.0
     loss_skip_threshold = args.loss_skip_threshold
     skipped_steps = 0
@@ -1409,17 +1479,29 @@ def main() -> None:
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
 
+        # EMA: update shadow weights every step
+        if args.ema_enabled:
+            current_flat = {k: np.array(v.astype(mx.float32)) for k, v in tree_flatten(model.state)}
+            if ema_state is None:
+                ema_state = {k: v.copy() for k, v in current_flat.items()}
+            else:
+                decay = args.ema_decay
+                for k in ema_state:
+                    ema_state[k] = decay * ema_state[k] + (1.0 - decay) * current_flat[k]
+
         # SWA: accumulate weight snapshots during warmdown
+        # When EMA is active, SWA averages the EMA weights (smoother baseline)
         scale = args.lr_mul(step, approx_train_time_ms)
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            current_flat = {k: np.array(v.astype(mx.float32)) for k, v in tree_flatten(model.state)}
+            snapshot = ema_state if (args.ema_enabled and ema_state is not None) else \
+                {k: np.array(v.astype(mx.float32)) for k, v in tree_flatten(model.state)}
             if swa_state is None:
-                swa_state = {k: v.copy() for k, v in current_flat.items()}
+                swa_state = {k: v.copy() for k, v in snapshot.items()}
                 swa_count = 1
                 log(f"swa:start step:{step}")
             else:
                 for k in swa_state:
-                    swa_state[k] += current_flat[k]
+                    swa_state[k] += snapshot[k]
                 swa_count += 1
 
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
@@ -1432,7 +1514,7 @@ def main() -> None:
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
-    # Apply SWA if collected
+    # Apply SWA if collected (already averages EMA snapshots when both are active)
     if args.swa_enabled and swa_state is not None and swa_count > 1:
         log(f"swa:applying averaged {swa_count} checkpoints")
         current_state = dict(tree_flatten(model.state))
@@ -1441,9 +1523,18 @@ def main() -> None:
             for k, v in swa_state.items()
         }
         model.update(tree_unflatten(list(swa_flat.items())))
+    elif args.ema_enabled and ema_state is not None:
+        # EMA without SWA: apply EMA weights directly
+        log("ema:applying")
+        current_state = dict(tree_flatten(model.state))
+        ema_flat = {
+            k: mx.array(v).astype(current_state[k].dtype)
+            for k, v in ema_state.items()
+        }
+        model.update(tree_unflatten(list(ema_flat.items())))
 
     # ==============================================================================
-    # PRE-QUANT EVAL (of the actual model that will be quantized, incl. SWA)
+    # PRE-QUANT EVAL (of the actual model that will be quantized, incl. SWA/EMA)
     # ==============================================================================
     pre_val_loss, pre_val_bpb = eval_val(
         args,

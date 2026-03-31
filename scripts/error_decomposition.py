@@ -27,7 +27,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
     GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
-    quantize_state_dict_int8, dequantize_state_dict_int8,
+    quantize_state_dict_int8, dequantize_state_dict_int8, rms_norm,
 )
 
 
@@ -38,10 +38,10 @@ def forward_collecting_activations(model, x_tokens, slope):
     plus MLP pre-activations for disagreement analysis.
     """
     x = mx.array(x_tokens[np.newaxis, :])
-    tok_emb = model.tok_emb(x)
+    tok_emb = model.tok_emb(x).astype(COMPUTE_DTYPE)
     if model.bigram is not None:
         tok_emb = tok_emb + model.bigram(x)
-    x0 = model.smear(tok_emb)
+    x0 = model.smear(rms_norm(tok_emb))
     h = x0
 
     block_activations = []  # (pre, post) hidden states
@@ -164,6 +164,7 @@ def main():
         mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
         bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
         lrelu_slope=hparams.lrelu_slope,
+        xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
     )
 
     print(f"Loading checkpoint: {args_cli.checkpoint}")

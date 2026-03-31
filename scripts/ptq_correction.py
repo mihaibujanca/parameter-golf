@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import math
 import os
 import sys
@@ -40,9 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
     GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
     quantize_state_dict_int8, dequantize_state_dict_int8, load_data_shard,
-    build_sentencepiece_luts, validate_dataset_tokenizer_pair, eval_val,
+    build_sentencepiece_luts, validate_dataset_tokenizer_pair, eval_val, rms_norm,
 )
 
+log = logging.getLogger("ptq_correction")
 
 # =============================================================================
 # CorrectionNet — small network to predict quantization error correction
@@ -82,10 +84,10 @@ def forward_with_hidden_collection(model, x_tokens, slope, collect_at):
     Returns: (logits, {layer_idx: hidden_state}) where hidden_state is post-block.
     """
     x = mx.array(x_tokens[np.newaxis, :])
-    tok_emb = model.tok_emb(x)
+    tok_emb = model.tok_emb(x).astype(COMPUTE_DTYPE)
     if model.bigram is not None:
         tok_emb = tok_emb + model.bigram(x)
-    x0 = model.smear(tok_emb)
+    x0 = model.smear(rms_norm(tok_emb))
     h = x0
 
     collected = {}
@@ -127,10 +129,10 @@ def forward_corrected(model, x_tokens, slope, corrections, correction_layers, fl
     Returns: (logits, corrected_hidden_at_correction_points)
     """
     x = mx.array(x_tokens[np.newaxis, :])
-    tok_emb = model.tok_emb(x)
+    tok_emb = model.tok_emb(x).astype(COMPUTE_DTYPE)
     if model.bigram is not None:
         tok_emb = tok_emb + model.bigram(x)
-    x0 = model.smear(tok_emb)
+    x0 = model.smear(rms_norm(tok_emb))
     h = x0
 
     n_enc = model.num_encoder_layers
@@ -223,7 +225,7 @@ def train_corrections(
     opt_state_initialized = False
 
     # Pre-cache float hidden states for train sequences
-    print(f"Caching float hidden states ({n_train_seqs} seqs)...")
+    log.info(f"Caching float hidden states ({n_train_seqs} seqs)...")
     float_cache = []
     float_logits_cache = []
     for s in range(n_train_seqs):
@@ -235,7 +237,7 @@ def train_corrections(
         float_logits_cache.append(mx.stop_gradient(logits))
 
     actual_train_seqs = len(float_cache)
-    print(f"Cached {actual_train_seqs} sequences")
+    log.info(f"Cached {actual_train_seqs} sequences")
 
     def loss_fn(params, seq_idx):
         """Compute loss for one sequence.
@@ -270,9 +272,12 @@ def train_corrections(
 
     grad_fn = mx.value_and_grad(loss_fn)
 
-    print(f"\nTraining corrections: layers={correction_layers}, hidden={hidden_size}, "
+    log.info(f"\nTraining corrections: layers={correction_layers}, hidden={hidden_size}, "
           f"epochs={n_epochs}, lr={lr}")
     t0 = time.time()
+
+    best_loss = float("inf")
+    best_params = None
 
     for epoch in range(n_epochs):
         epoch_loss = 0.0
@@ -297,12 +302,21 @@ def train_corrections(
             mx.eval(get_all_params())
             epoch_loss += loss.item()
 
-        if (epoch + 1) % 20 == 0 or epoch == 0:
-            avg = epoch_loss / actual_train_seqs
-            elapsed = time.time() - t0
-            print(f"  epoch {epoch+1:>4d}/{n_epochs}  loss={avg:.6f}  elapsed={elapsed:.1f}s")
+        avg = epoch_loss / actual_train_seqs
+        if avg < best_loss:
+            best_loss = avg
+            best_params = [mx.array(p) for p in get_all_params()]
 
-    print(f"Training done in {time.time() - t0:.1f}s")
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            elapsed = time.time() - t0
+            log.info(f"  epoch {epoch+1:>4d}/{n_epochs}  loss={avg:.6f}  best={best_loss:.6f}  elapsed={elapsed:.1f}s")
+
+    # Restore best checkpoint
+    if best_params is not None:
+        set_all_params(best_params)
+        log.info(f"Restored best checkpoint (loss={best_loss:.6f})")
+
+    log.info(f"Training done in {time.time() - t0:.1f}s")
     return corrections
 
 
@@ -346,7 +360,7 @@ def eval_corrected_bpb(model_quant, corrections, correction_layers, model_float,
     # Approximate: for sp1024, ~1.06 bytes per token on average
     # But for proper BPB we need the byte counts. Use rough estimate.
     bits_per_token = val_loss / math.log(2)
-    print(f"  Corrected val_loss={val_loss:.4f} bits_per_token={bits_per_token:.4f}")
+    log.info(f"  Corrected val_loss={val_loss:.4f} bits_per_token={bits_per_token:.4f}")
     return val_loss
 
 
@@ -369,10 +383,33 @@ def main():
                              "MUST be 'train' for anything going into submission. "
                              "'val' is for reference/debugging ONLY.")
     parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Log file path. Auto-generated from config if omitted.")
     args_cli = parser.parse_args()
 
     correction_layers = [int(x) for x in args_cli.correction_layers.split(",")]
     hparams = Hyperparameters()
+
+    # Set up logging: console + file
+    global log
+    log = logging.getLogger("ptq_correction")
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(message)s")
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+
+    if args_cli.log_file is None:
+        h_tag = f"h{args_cli.hidden_size}" if args_cli.hidden_size > 0 else "linear"
+        layers_tag = "".join(str(l) for l in correction_layers)
+        bits = hparams.quant_attn_bits
+        args_cli.log_file = f"logs/ptq_{h_tag}_int{bits}_L{layers_tag}_{args_cli.n_epochs}ep.txt"
+
+    os.makedirs(os.path.dirname(args_cli.log_file), exist_ok=True)
+    fh = logging.FileHandler(args_cli.log_file, mode="w")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    log.info(f"Logging to {args_cli.log_file}")
 
     per_layer = None
     if hparams.mlp_mult_per_layer:
@@ -389,14 +426,15 @@ def main():
             mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
             bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
             lrelu_slope=hparams.lrelu_slope,
+            xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
         )
 
     # Load float model
-    print(f"Loading checkpoint: {args_cli.checkpoint}")
-    print(f"Config: {hparams.num_layers}L/{hparams.model_dim}d, MLP {hparams.mlp_mult}x, "
+    log.info(f"Loading checkpoint: {args_cli.checkpoint}")
+    log.info(f"Config: {hparams.num_layers}L/{hparams.model_dim}d, MLP {hparams.mlp_mult}x, "
           f"act={hparams.mlp_act}, quant=a{hparams.quant_attn_bits}m{hparams.quant_mlp_bits}")
-    print(f"Correction layers: {correction_layers}, hidden={args_cli.hidden_size}")
-    print(f"Data split for training: {args_cli.data_split}"
+    log.info(f"Correction layers: {correction_layers}, hidden={args_cli.hidden_size}")
+    log.info(f"Data split for training: {args_cli.data_split}"
           f"{' *** REFERENCE ONLY - DO NOT SUBMIT ***' if args_cli.data_split == 'val' else ''}")
 
     model_float = build_model()
@@ -405,9 +443,17 @@ def main():
     mx.eval(model_float.parameters())
 
     # Build quantized model
-    print("Quantizing model...")
+    log.info("Quantizing model...")
     model_quant = build_model()
     cat_bits = {"attn": hparams.quant_attn_bits, "mlp": hparams.quant_mlp_bits}
+    # Per-layer overrides from QUANT_BITS env var (e.g. "attn:4,mlp:5,mlp.10:4")
+    quant_bits_str = os.environ.get("QUANT_BITS", "")
+    if quant_bits_str:
+        cat_bits = {}
+        for part in quant_bits_str.split(","):
+            k, v = part.strip().rsplit(":", 1)
+            cat_bits[k.strip()] = int(v.strip())
+        log.info(f"Per-layer quant: {cat_bits}")
     quant_obj, quant_stats = quantize_state_dict_int8(flat, cat_bits=cat_bits)
     quant_flat = dequantize_state_dict_int8(quant_obj)
     model_quant.update(tree_unflatten(list(quant_flat.items())))
@@ -418,26 +464,26 @@ def main():
     if args_cli.data_split == "train":
         train_tokens = load_train_tokens(hparams,
                                          max_tokens=args_cli.n_train_seqs * args_cli.seq_len + 1024)
-        print(f"Train tokens: {len(train_tokens):,}")
+        log.info(f"Train tokens: {len(train_tokens):,}")
     else:
         train_tokens = val_tokens
-        print(f"*** Using val tokens for training (REFERENCE ONLY) ***")
-    print(f"Val tokens: {len(val_tokens):,}")
+        log.info(f"*** Using val tokens for training (REFERENCE ONLY) ***")
+    log.info(f"Val tokens: {len(val_tokens):,}")
 
     # Baseline: uncorrected quant eval
-    print("\n=== Baseline (no correction) ===")
+    log.info("\n=== Baseline (no correction) ===")
     eval_corrected_bpb(model_quant, {}, [], model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
     # Oracle correction: at correction points, replace quant hidden with float hidden
-    print("\n=== Oracle correction (upper bound) ===")
+    log.info("\n=== Oracle correction (upper bound) ===")
     oracle_corrections = {}  # Empty corrections but we'll hack the forward
     # For oracle, just run float model — that gives us the upper bound
     eval_corrected_bpb(model_float, {}, [], model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
     # Train corrections
-    print(f"\n=== Training corrections ({args_cli.data_split} split) ===")
+    log.info(f"\n=== Training corrections ({args_cli.data_split} split) ===")
     corrections = train_corrections(
         model_float, model_quant, train_tokens, val_tokens, hparams,
         correction_layers, hidden_size=args_cli.hidden_size,
@@ -447,7 +493,7 @@ def main():
     )
 
     # Evaluate corrected model
-    print("\n=== Corrected model ===")
+    log.info("\n=== Corrected model ===")
     eval_corrected_bpb(model_quant, corrections, correction_layers, model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
@@ -456,12 +502,12 @@ def main():
     for i, net in corrections.items():
         n = sum(v.size for _, v in tree_flatten(net.parameters()))
         total_correction_params += n
-        print(f"  Correction L{i}: {n:,} params")
-    print(f"  Total correction params: {total_correction_params:,} "
+        log.info(f"  Correction L{i}: {n:,} params")
+    log.info(f"  Total correction params: {total_correction_params:,} "
           f"({100*total_correction_params/(hparams.model_dim * hparams.model_dim * hparams.num_layers):.2f}% of model)")
     # Estimate compressed size
     est_bytes = total_correction_params * 1  # int8 = 1 byte/param
-    print(f"  Estimated artifact overhead: ~{est_bytes/1024:.1f} KB (int8)")
+    log.info(f"  Estimated artifact overhead: ~{est_bytes/1024:.1f} KB (int8)")
 
 
 if __name__ == "__main__":
