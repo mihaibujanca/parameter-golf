@@ -1,0 +1,15 @@
+rank,run_id,arch,act,n_params,val_bpb,quant_mb_int6
+1,warmdown_from14k,13L/3x,lrelu2,31815273,1.4135,20.50
+2,overnight_11L_4x_from4k,11L/4x,lrelu2,32859225,1.4215,19.72
+3,warmdown2_11L_4x,11L/4x,lrelu2,32859225,1.4222,19.60
+4,warmdown_from8k,13L/3x,lrelu2,31815273,1.4294,19.79
+5,wd70_11L_5x,11L/5x,lrelu2,38626393,1.4391,22.03
+6,wd50_11L_5x,11L/5x,lrelu2,38626393,1.4402,21.89
+7,warmdown_sugar_11L_4x,11L/4x,sugar,32859225,1.4453,20.35
+8,warmdown_11L_5x,11L/5x,lrelu2,38626393,1.4640,21.98
+9,warmdown_11L_4x_from5k,11L/4x,lrelu2,32859225,1.4654,19.60
+10,warmdown_11L_45x,11L/4.5x,lrelu2,35742809,1.4655,20.76
+11,sugar_11L_4x_5k,11L/4x,sugar,32859225,1.5140,20.34
+12,11L_5x_xsa_ema,11L/5x,lrelu2,38626393,1.5148,22.09
+13,11L_45x_xsa_ema,11L/4.5x,lrelu2,35742809,1.5164,20.75
+14,11L_4x_xsa_ema,11L/4x,lrelu2,32859225,1.5173,19.59
