@@ -262,14 +262,39 @@ def load_data_shard(path: Path) -> np.ndarray:
 # ==============================================================================
 
 
+def _load_skip_shards() -> set[str]:
+    """Load shard skip list from SKIP_SHARDS env var and/or SHARD_MANIFEST json."""
+    skip: set[str] = set()
+    env_skip = os.environ.get("SKIP_SHARDS", "")
+    if env_skip:
+        skip.update(s.strip() for s in env_skip.split(",") if s.strip())
+    manifest_path = os.environ.get("SHARD_MANIFEST", "")
+    if manifest_path:
+        with open(manifest_path) as f:
+            manifest = json.loads(f.read())
+        for shard in manifest.get("shards", []):
+            if shard.get("skip", False):
+                skip.add(shard["file"])
+    return skip
+
+
 class TokenStream:
     def __init__(
         self,
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        skip_shards: set[str] | None = None,
     ):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        all_files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if skip_shards:
+            before = len(all_files)
+            self.files = [f for f in all_files if f.name not in skip_shards]
+            skipped = before - len(self.files)
+            if skipped and log_fn:
+                log_fn(f"shard_filter:skipped {skipped}/{before} shards via skip list")
+        else:
+            self.files = all_files
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.epoch = 1
@@ -317,8 +342,10 @@ class TokenLoader:
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
         vocab_size: int = 1024,
+        skip_shards: set[str] | None = None,
     ):
-        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name,
+                                  skip_shards=skip_shards)
         self.log_fn = log_fn
         self.skipped_seqs = 0
 
@@ -1255,7 +1282,11 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, vocab_size=args.vocab_size)
+    skip_shards = _load_skip_shards()
+    if skip_shards:
+        log(f"skip_shards:{sorted(skip_shards)}")
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name,
+                               vocab_size=args.vocab_size, skip_shards=skip_shards)
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -1394,7 +1425,8 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, vocab_size=args.vocab_size)
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name,
+                                   vocab_size=args.vocab_size, skip_shards=skip_shards)
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
