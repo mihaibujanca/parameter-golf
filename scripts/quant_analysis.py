@@ -43,7 +43,7 @@ def per_layer_sensitivity(
     """
     import mlx.core as mx
     from mlx.utils import tree_unflatten
-    from train_gpt_mlx import quantize_state_dict_int8, dequantize_state_dict_int8
+    from train_gpt_mlx import quantize_state_dict_int8, dequantize_state_dict_int8, _QUANT_FN
 
     # Float baseline
     model = build_model_fn()
