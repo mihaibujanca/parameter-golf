@@ -141,8 +141,12 @@ def quantize_configurable(
     attn_bits: int = 6,
     mlp_bits: int = 6,
     hadamard: bool = False,
+    per_layer_bits: dict[str, int] | None = None,
 ) -> tuple[dict[str, object], dict[str, int]]:
     """Quantize with configurable bit-widths and optional Hadamard rotation.
+
+    per_layer_bits: optional overrides like {"mlp.0": 6, "attn.3": 5}.
+    Falls back to attn_bits/mlp_bits for layers not in the dict.
 
     Returns (quant_obj, stats) in the same format as quantize_state_dict_int8().
     """
@@ -190,13 +194,16 @@ def quantize_configurable(
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
 
-        # Determine bit-width for this param
-        if cat == "attn":
-            bits = attn_bits
-        elif cat == "mlp":
-            bits = mlp_bits
-        else:
-            bits = 8  # fallback
+        # Determine bit-width for this param (per-layer override, then category)
+        bits = (per_layer_bits or {}).get(cat)
+        if bits is None:
+            base_cat = cat.split(".")[0]
+            if base_cat == "attn":
+                bits = attn_bits
+            elif base_cat == "mlp":
+                bits = mlp_bits
+            else:
+                bits = 8
 
         quant_fn = QUANT_FN[bits]
 
@@ -296,12 +303,18 @@ CONFIGS = {
     "int6":  {"label": "int6 per-row (current SOTA)",     "attn_bits": 6,    "mlp_bits": 6,    "hadamard": False},
     "int5":  {"label": "int5 per-row",                    "attn_bits": 5,    "mlp_bits": 5,    "hadamard": False},
     "int4":  {"label": "int4 per-row (no rotation)",      "attn_bits": 4,    "mlp_bits": 4,    "hadamard": False},
+    "int3":  {"label": "int3 per-row",                    "attn_bits": 3,    "mlp_bits": 3,    "hadamard": False},
+    "int2":  {"label": "int2 per-row",                    "attn_bits": 2,    "mlp_bits": 2,    "hadamard": False},
     "int4h": {"label": "int4 per-row + Hadamard rotation","attn_bits": 4,    "mlp_bits": 4,    "hadamard": True},
     "int5h": {"label": "int5 per-row + Hadamard rotation","attn_bits": 5,    "mlp_bits": 5,    "hadamard": True},
     # Mixed configs
     "i6a4m":  {"label": "int6-attn / int4-MLP",           "attn_bits": 6,    "mlp_bits": 4,    "hadamard": False},
     "i6a4mh": {"label": "int6-attn / int4-MLP + Hadamard","attn_bits": 6,    "mlp_bits": 4,    "hadamard": True},
     "i6a5m":  {"label": "int6-attn / int5-MLP",           "attn_bits": 6,    "mlp_bits": 5,    "hadamard": False},
+    # Per-layer mixed precision: single MLP layer upgraded, rest int4
+    **{f"i6a4m_L{i}m{b}": {"label": f"a6/m4 + L{i} MLP int{b}", "attn_bits": 6, "mlp_bits": 4, "hadamard": False,
+                             "per_layer_bits": {f"mlp.{i}": b}}
+       for b in [5, 6] for i in range(20)},
 }
 
 
@@ -359,6 +372,10 @@ def main():
         mlp_mult_per_layer=per_layer,
         bigram_vocab_size=hparams.bigram_vocab_size,
         bigram_dim=hparams.bigram_dim,
+        logit_temp=hparams.logit_temp,
+        lrelu_slope=hparams.lrelu_slope,
+        xsa_last_n=hparams.xsa_last_n,
+        rope_dims=hparams.rope_dims,
     )
 
     ckpt_path = Path(args_cli.checkpoint)
@@ -403,6 +420,7 @@ def main():
                 attn_bits=cfg["attn_bits"],
                 mlp_bits=cfg["mlp_bits"],
                 hadamard=cfg["hadamard"],
+                per_layer_bits=cfg.get("per_layer_bits"),
             )
 
             # Estimate compressed artifact size

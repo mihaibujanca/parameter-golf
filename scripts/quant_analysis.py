@@ -60,11 +60,14 @@ def per_layer_sensitivity(
                 cat_bits = {f'{comp}.{i}': target_bits}
             qobj, _ = quantize_state_dict_int8(flat_state, cat_bits=cat_bits)
             qflat = dequantize_state_dict_int8(qobj)
-            m = build_model_fn()
-            m.update(tree_unflatten(list(qflat.items())))
-            mx.eval(m.parameters())
-            gap = eval_bpb_fn(m) - float_bpt
+            model.update(tree_unflatten(list(qflat.items())))
+            mx.eval(model.parameters())
+            gap = eval_bpb_fn(model) - float_bpt
             results[comp].append(gap)
+            del qobj, qflat
+            # Restore float weights for next iteration
+            model.update(tree_unflatten(list(flat_state.items())))
+            mx.eval(model.parameters())
 
     return results
 
@@ -204,6 +207,9 @@ def main():
     parser.add_argument("--quant-bits", type=str, default="",
                         help="Quant allocation (e.g. 'attn:4,mlp:5,mlp.10:4'). "
                              "If empty, runs sensitivity analysis first to determine allocation.")
+    parser.add_argument("--target-bits", type=str, default="4",
+                        help="Comma-separated bitwidths for sensitivity sweep (default: '4'). "
+                             "E.g. '3,4,5' runs sensitivity at int3, int4, and int5.")
     parser.add_argument("--demote-threshold", type=float, default=0.002,
                         help="Sensitivity threshold below which MLP layers get demoted to int4")
     parser.add_argument("--n-correction-layers", type=int, default=3)
@@ -214,6 +220,8 @@ def main():
                         help="Save analysis results to JSON")
     parser.add_argument("--skip-sensitivity", action="store_true",
                         help="Skip sensitivity analysis, require --quant-bits")
+    parser.add_argument("--skip-compound", action="store_true",
+                        help="Skip compound error profile (avoids Metal crash on large models)")
     args = parser.parse_args()
 
     import mlx.core as mx
@@ -267,6 +275,8 @@ def main():
     analysis = {'checkpoint': args.checkpoint, 'num_layers': hparams.num_layers}
 
     # Step 1: Sensitivity (or skip if quant-bits provided)
+    target_bits_list = [int(b) for b in args.target_bits.split(",")]
+
     if args.quant_bits and args.skip_sensitivity:
         cat_bits = {}
         for part in args.quant_bits.split(","):
@@ -274,10 +284,19 @@ def main():
             cat_bits[k.strip()] = int(v.strip())
         print(f"Using provided quant allocation: {cat_bits}")
     else:
-        print("=== Per-layer sensitivity ===")
-        sensitivity = per_layer_sensitivity(build_model, flat, eval_bpb, hparams.num_layers)
-        print_sensitivity(sensitivity, hparams.num_layers)
+        # Run sensitivity at each requested bitwidth
+        all_sensitivity = {}
+        for tb in target_bits_list:
+            print(f"\n=== Per-layer sensitivity (int{tb}) ===")
+            sens = per_layer_sensitivity(build_model, flat, eval_bpb, hparams.num_layers, target_bits=tb)
+            print_sensitivity(sens, hparams.num_layers)
+            all_sensitivity[tb] = sens
+
+        # Store primary (first bitwidth) as 'sensitivity' for backward compat
+        sensitivity = all_sensitivity[target_bits_list[0]]
         analysis['sensitivity'] = sensitivity
+        # Store all bitwidths in 'sensitivity_by_bits'
+        analysis['sensitivity_by_bits'] = {str(b): s for b, s in all_sensitivity.items()}
 
         if args.quant_bits:
             cat_bits = {}
@@ -292,17 +311,20 @@ def main():
     analysis['cat_bits'] = cat_bits
 
     # Step 2: Compound error profile
-    print("\n=== Compound error profile ===")
-    profile = compound_error_profile(build_model, flat, cat_bits, val_tokens,
-                                     hparams.num_layers, n_seqs=args.n_profile_seqs,
-                                     seq_len=args.seq_len)
-    print_compound_profile(profile)
-    analysis['compound_profile'] = profile
+    if not args.skip_compound:
+        print("\n=== Compound error profile ===")
+        profile = compound_error_profile(build_model, flat, cat_bits, val_tokens,
+                                         hparams.num_layers, n_seqs=args.n_profile_seqs,
+                                         seq_len=args.seq_len)
+        print_compound_profile(profile)
+        analysis['compound_profile'] = profile
 
-    # Step 3: Optimal correction layers
-    correction_layers = optimal_correction_layers(profile, args.n_correction_layers)
-    print(f"\nOptimal correction layers: {correction_layers}")
-    analysis['correction_layers'] = correction_layers
+        # Step 3: Optimal correction layers
+        correction_layers = optimal_correction_layers(profile, args.n_correction_layers)
+        print(f"\nOptimal correction layers: {correction_layers}")
+        analysis['correction_layers'] = correction_layers
+    else:
+        print("\nSkipping compound error profile")
 
     # Save
     if args.save_analysis:

@@ -44,10 +44,23 @@ BUDGET_BYTES = 16 * MB  # 16 MB hard limit
 
 
 # ---------------------------------------------------------------------------
-# Compression ratio table: (quant_bits, weight_decay) → zstd-22 ratio
-# These are empirical fits from PR data. The ratio applies to the *raw payload*
-# (int8-container bytes + fp16 scale bytes). Higher WD → smaller weights →
-# more zero high bits → better compression.
+# Compression ratio table: (quant_bits, weight_decay, compressor) → ratio
+# Empirical fits from PR data and local M4/Mac Studio measurements.
+# The ratio applies to the *raw payload* (int8-container bytes + fp16 scale
+# bytes). Higher WD → smaller weights → more zero high bits → better
+# compression.
+#
+# Compressor options: "zstd" (zstd-22), "brotli" (brotli-11), "zpaq" (method 5).
+# Weight permutation sorts MLP neurons by quant scale before compression,
+# improving MLP compressibility by ~3% (lossless).
+#
+# Calibration data (2026-04-02, int4+permute+brotli across 8 models + 640d):
+#   13L/3x 31.8M: brotli 11.47, zpaq 11.23, perm saves 0.63 MB
+#   11L/4x 32.9M: brotli 11.02, zpaq 10.78, perm saves 0.83 MB
+#   11L/5x 38.6M: brotli 12.58, zpaq 12.29, perm saves 1.15 MB
+#   11L/4.5x 35.7M: brotli 11.97, zpaq 11.69, perm saves 0.99 MB
+#   13L/3x/640d 49.2M: brotli 18.96, zpaq 18.56, perm saves 0.54 MB
+# zpaq saves ~2-3% over brotli consistently.
 # ---------------------------------------------------------------------------
 
 # int6 compression: PR #162 (WD=0.02) → 1.55x; PR #179 (WD=0.038) → 1.80x
@@ -64,26 +77,64 @@ _INT5_ZSTD_WD_SLOPE = 9.0
 _INT8_ZSTD_BASE = 1.27
 _INT8_ZSTD_WD_SLOPE = 2.0
 
-# fp16 passthrough: zstd-22 barely compresses random fp16 values
+# int4: Calibrated on 8 M4 models + 640d (WD=0.04) with brotli+permute.
+# 512d models: 2.84x-3.13x (avg 3.02x). 640d: 2.64x (~12% worse).
+# Conservative base targets 640d. 512d predictions will over-estimate size by ~10%.
+_INT4_BROTLI_BASE = 2.10
+_INT4_BROTLI_WD_SLOPE = 13.5
+
+# int3: Calibrated on 640d model (WD=0.04) with brotli+permute.
+# int3-all → 3.97x brotli. int3a+int4m → 3.00x (mixed, not a pure int3 ratio).
+_INT3_BROTLI_BASE = 3.00
+_INT3_BROTLI_WD_SLOPE = 24.0
+
+# fp16 passthrough: barely compresses
 _FP16_ZSTD_RATIO = 1.05
 
 TORCH_OVERHEAD_BYTES = 55_000  # torch npz pickling overhead, code + submission.json
 
+# Weight permutation: lossless MLP neuron reordering by quant scale.
+# Saves ~3% of MLP compressed size (measured 0.54-1.15 MB across models).
+_PERMUTE_MLP_BONUS = 1.03
 
-def _zstd_ratio(bits: int, weight_decay: float) -> float:
-    """Empirical zstd-22 compression ratio for quantized weight matrices."""
+# zpaq-5 saves ~2.5% over brotli-11 consistently.
+_ZPAQ_VS_BROTLI = 1.025
+# zstd-22 is ~5% worse than brotli-11 on quantized weights.
+_ZSTD_VS_BROTLI = 0.95
+
+
+def _compression_ratio(bits: int, weight_decay: float, compressor: str = "brotli",
+                        is_mlp: bool = False, permuted: bool = True) -> float:
+    """Empirical compression ratio for quantized weight matrices.
+
+    Base ratios are calibrated on brotli-11 with weight permutation at WD=0.04.
+    """
     if bits == 8:
-        return _INT8_ZSTD_BASE + _INT8_ZSTD_WD_SLOPE * weight_decay
+        ratio = _INT8_ZSTD_BASE + _INT8_ZSTD_WD_SLOPE * weight_decay
     elif bits == 6:
-        return _INT6_ZSTD_BASE + _INT6_ZSTD_WD_SLOPE * weight_decay
+        ratio = _INT6_ZSTD_BASE + _INT6_ZSTD_WD_SLOPE * weight_decay
     elif bits == 5:
-        return _INT5_ZSTD_BASE + _INT5_ZSTD_WD_SLOPE * weight_decay
+        ratio = _INT5_ZSTD_BASE + _INT5_ZSTD_WD_SLOPE * weight_decay
     elif bits == 4:
-        # int4: 4 zero high bits per byte → strong compression
-        # Calibrated on M4 actuals: 80k→2.73x, 5k→2.63x at WD=0.04
-        return 2.20 + 13.0 * weight_decay
+        ratio = _INT4_BROTLI_BASE + _INT4_BROTLI_WD_SLOPE * weight_decay
+    elif bits == 3:
+        ratio = _INT3_BROTLI_BASE + _INT3_BROTLI_WD_SLOPE * weight_decay
     else:
         raise ValueError(f"Unsupported quant bits: {bits}")
+    # Weight permutation bonus (MLP only)
+    if is_mlp and permuted:
+        ratio *= _PERMUTE_MLP_BONUS
+    # Compressor adjustment (base is brotli-11)
+    if compressor == "zpaq":
+        ratio *= _ZPAQ_VS_BROTLI
+    elif compressor == "zstd":
+        ratio *= _ZSTD_VS_BROTLI
+    return ratio
+
+
+def _zstd_ratio(bits: int, weight_decay: float) -> float:
+    """Empirical zstd-22 compression ratio (legacy, prefer _compression_ratio)."""
+    return _compression_ratio(bits, weight_decay, compressor="zstd", is_mlp=False, permuted=False)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +248,8 @@ def estimate_artifact_bytes(
     mlp_bits: int = 6,
     embed_fp16: bool = True,
     weight_decay: float = 0.02,
-    compression: str = "zstd",
+    compression: str = "brotli",
+    permute: bool = True,
     small_tensor_threshold: int = 65_536,
 ) -> dict:
     """
@@ -208,16 +260,18 @@ def estimate_artifact_bytes(
     vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult, mlp_act
         Model architecture.
     attn_bits : int
-        Quantization bits for attention weight matrices (5, 6, or 8).
+        Quantization bits for attention weight matrices (3, 4, 5, 6, or 8).
     mlp_bits : int
-        Quantization bits for MLP weight matrices (5, 6, or 8).
+        Quantization bits for MLP weight matrices (3, 4, 5, 6, or 8).
     embed_fp16 : bool
         If True, tok_emb is kept as fp16 passthrough (not quantized).
         The current SOTA recipe always does this.
     weight_decay : float
         Muon weight decay value. Higher → better compression.
     compression : str
-        "zstd" (default, use zstd-22) or "zlib".
+        "brotli" (default, brotli-11), "zpaq" (zpaq method 5), or "zstd" (zstd-22).
+    permute : bool
+        If True (default), assume MLP weight permutation is applied.
     small_tensor_threshold : int
         Tensors with ≤ this many elements are kept in fp16 (not quantized).
 
@@ -229,15 +283,11 @@ def estimate_artifact_bytes(
     shapes = _matrix_shapes(num_layers, dim, num_heads, num_kv_heads, mlp_mult, mlp_act)
     params = _count_params(vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult, mlp_act)
 
-    if compression == "zstd":
-        attn_ratio = _zstd_ratio(attn_bits, weight_decay)
-        mlp_ratio = _zstd_ratio(mlp_bits, weight_decay)
-        fp16_ratio = _FP16_ZSTD_RATIO
-    else:
-        # zlib: roughly 80% of zstd-22 compression ratio
-        attn_ratio = _zstd_ratio(attn_bits, weight_decay) * 0.80
-        mlp_ratio = _zstd_ratio(mlp_bits, weight_decay) * 0.80
-        fp16_ratio = 1.03
+    attn_ratio = _compression_ratio(attn_bits, weight_decay, compressor=compression,
+                                     is_mlp=False, permuted=False)
+    mlp_ratio = _compression_ratio(mlp_bits, weight_decay, compressor=compression,
+                                    is_mlp=True, permuted=permute)
+    fp16_ratio = _FP16_ZSTD_RATIO
 
     breakdown: dict[str, dict] = {}
 
@@ -285,11 +335,12 @@ def estimate_artifact_bytes(
 
     breakdown["attn_matrices"] = {
         "numel": params["total_matrix_attn"], "raw_bytes": total_attn_raw,
-        "compressed_bytes": attn_compressed, "scheme": f"int{attn_bits}+{'zstd-22' if compression == 'zstd' else 'zlib'}",
+        "compressed_bytes": attn_compressed, "scheme": f"int{attn_bits}+{compression}",
     }
     breakdown["mlp_matrices"] = {
         "numel": params["total_matrix_mlp"], "raw_bytes": total_mlp_raw,
-        "compressed_bytes": mlp_compressed, "scheme": f"int{mlp_bits}+{'zstd-22' if compression == 'zstd' else 'zlib'}",
+        "compressed_bytes": mlp_compressed,
+        "scheme": f"int{mlp_bits}+{compression}{'+permute' if permute else ''}",
     }
     breakdown["small_tensors_fp16"] = {
         "numel": params["total_ln"], "raw_bytes": total_small_raw,
@@ -319,7 +370,7 @@ def estimate_artifact_bytes(
             "mlp_mult": mlp_mult, "mlp_act": mlp_act,
             "attn_bits": attn_bits, "mlp_bits": mlp_bits,
             "embed_fp16": embed_fp16, "weight_decay": weight_decay,
-            "compression": compression,
+            "compression": compression, "permute": permute,
         },
     }
 
@@ -335,7 +386,8 @@ def sweep_max_layers(
     mlp_bits: int = 6,
     embed_fp16: bool = True,
     weight_decay: float = 0.02,
-    compression: str = "zstd",
+    compression: str = "brotli",
+    permute: bool = True,
     max_layers: int = 20,
 ) -> list[dict]:
     """Find how many layers fit in 16 MB for a given architecture spec."""
@@ -347,6 +399,7 @@ def sweep_max_layers(
             mlp_mult=mlp_mult, mlp_act=mlp_act, attn_bits=attn_bits,
             mlp_bits=mlp_bits, embed_fp16=embed_fp16,
             weight_decay=weight_decay, compression=compression,
+            permute=permute,
         )
         results.append(r)
         if not r["fits"]:

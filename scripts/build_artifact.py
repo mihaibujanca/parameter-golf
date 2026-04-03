@@ -56,7 +56,7 @@ def main():
                         help="Load pre-trained correction weights instead of training")
     parser.add_argument("--no-permute", action="store_true",
                         help="Skip weight permutation (for comparison)")
-    parser.add_argument("--compressor", choices=["brotli", "zstd"], default="brotli")
+    parser.add_argument("--compressor", choices=["brotli", "zstd", "zpaq"], default="brotli")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated)")
     parser.add_argument("--budget", type=int, default=16_000_000,
@@ -73,9 +73,11 @@ def main():
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_flatten, tree_unflatten
+    import sentencepiece as spm
     from train_gpt_mlx import (
         GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
         quantize_state_dict_int8, dequantize_state_dict_int8, load_data_shard, rms_norm,
+        build_sentencepiece_luts, eval_val,
     )
 
     hparams = Hyperparameters()
@@ -119,8 +121,44 @@ def main():
     flat = dict(mx.load(args.checkpoint))
     log.info(f"Loaded {sum(v.size for v in flat.values()):,} params")
 
+    # Load val tokens and byte LUTs for eval_val
+    val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
+    sp = spm.SentencePieceProcessor(model_file=hparams.tokenizer_path)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, hparams.vocab_size)
+
+    def measure_bpb(model, label):
+        compiled_loss = mx.compile(
+            lambda x, y: model.loss(x, y),
+            inputs=model.state, outputs=model.state,
+        )
+        val_loss, val_bpb = eval_val(
+            hparams, compiled_loss, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        log.info(f"  {label}: val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
+        return val_bpb
+
+    # Step 1: Float baseline
+    log.info("Measuring float baseline...")
+    model_float = build_model()
+    model_float.update(tree_unflatten(list(flat.items())))
+    mx.eval(model_float.parameters())
+    float_bpb = measure_bpb(model_float, "float")
+
+    # Step 2: Quantize
     log.info("Quantizing...")
     qobj, _ = quantize_state_dict_int8(flat, cat_bits=cat_bits)
+
+    # Step 3: Measure quant roundtrip BPB
+    log.info("Measuring quant roundtrip...")
+    qflat = dequantize_state_dict_int8(qobj)
+    model_quant = build_model()
+    model_quant.update(tree_unflatten(list(qflat.items())))
+    mx.eval(model_quant.parameters())
+    quant_bpb = measure_bpb(model_quant, "quant")
+    log.info(f"  quant_gap: {quant_bpb - float_bpb:+.4f}")
+    del model_quant, qflat
 
     # Weight permutation for better compression (lossless)
     if not args.no_permute:
@@ -231,7 +269,22 @@ def main():
     raw = buf.getvalue()
 
     # Compress
-    if args.compressor == "brotli":
+    if args.compressor == "zpaq":
+        import subprocess, tempfile
+        raw_path = args.output or f"logs/{Path(args.checkpoint).stem}_artifact"
+        raw_path = raw_path.rstrip(".zpaq") + ".raw"
+        with open(raw_path, "wb") as f:
+            f.write(raw)
+        zpaq_path = raw_path.replace(".raw", ".zpaq")
+        # Remove stale zpaq archive if it exists (zpaq appends by default)
+        if os.path.exists(zpaq_path):
+            os.remove(zpaq_path)
+        subprocess.run(["/opt/homebrew/bin/zpaq", "a", zpaq_path, raw_path, "-method", "5"],
+                       check=True)
+        with open(zpaq_path, "rb") as f:
+            blob = f.read()
+        os.remove(raw_path)
+    elif args.compressor == "brotli":
         import brotli
         blob = brotli.compress(raw, quality=11)
     else:
@@ -246,15 +299,21 @@ def main():
     with open(args.output, "wb") as f:
         f.write(blob)
 
+    artifact_mb = len(blob) / 1e6
     fits = len(blob) <= args.budget
     log.info("")
     log.info("=== Artifact Summary ===")
     log.info(f"Raw:        {len(raw)/1e6:.2f} MB")
-    log.info(f"Compressed: {len(blob)/1e6:.2f} MB ({args.compressor})")
+    log.info(f"Compressed: {artifact_mb:.2f} MB ({args.compressor})")
     log.info(f"Budget:     {args.budget/1e6:.2f} MB")
     log.info(f"Margin:     {(args.budget - len(blob))/1e6:+.2f} MB")
     log.info(f"Fits:       {'YES' if fits else 'NO'}")
     log.info(f"Saved:      {args.output}")
+    log.info("")
+    log.info("=== BPB Tracking ===")
+    log.info(f"Float BPB:  {float_bpb:.4f}")
+    log.info(f"Quant BPB:  {quant_bpb:.4f}  (gap: {quant_bpb - float_bpb:+.4f})")
+    log.info(f"Score:      {quant_bpb * artifact_mb:.4f}  (BPB x MB)")
 
 
 if __name__ == "__main__":

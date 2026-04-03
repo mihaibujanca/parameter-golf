@@ -5,6 +5,10 @@ verify_artifact.py — Load a compressed artifact and verify correctness.
 Decompresses, dequantizes, reconstructs corrections, runs eval,
 and compares against float model.
 
+Uses eval_val() from train_gpt_mlx.py for BPB — same compiled loss, same byte
+counting, same token set as training. Reports float BPB, quant BPB (no corrections),
+and quant+correction comparison metrics (KL, Top-1, Cos).
+
 Usage:
     NUM_LAYERS=11 MLP_MULT=4.5 MLP_ACT=lrelu2 XSA_LAST_N=11 ROPE_DIMS=16 \
     .venv/bin/python3 scripts/verify_artifact.py logs/11L_45x_final.br \
@@ -96,21 +100,23 @@ def main():
     parser = argparse.ArgumentParser(description="Verify compressed artifact")
     parser.add_argument("artifact", help="Path to compressed artifact (.br or .zs)")
     parser.add_argument("--float-checkpoint", type=str, required=True,
-                        help="Path to float checkpoint (for correction eval)")
-    parser.add_argument("--n-seqs", type=int, default=16)
-    parser.add_argument("--seq-len", type=int, default=1024)
+                        help="Path to float checkpoint (for comparison)")
+    parser.add_argument("--n-comparison-seqs", type=int, default=32,
+                        help="Number of seqs for KL/Top-1/Cos comparison (default 32)")
     args = parser.parse_args()
 
     import mlx.core as mx
     import mlx.nn as nn
+    import sentencepiece as spm
     from mlx.utils import tree_flatten, tree_unflatten
     from train_gpt_mlx import (
         GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
-        dequantize_state_dict_int8, rms_norm,
+        dequantize_state_dict_int8, rms_norm, build_sentencepiece_luts, eval_val,
     )
     from scripts.ptq_correction import forward_with_hidden_collection, forward_corrected
 
     hparams = Hyperparameters()
+    seq_len = hparams.train_seq_len
 
     def build_model():
         per_layer = None
@@ -129,87 +135,119 @@ def main():
             xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
         )
 
-    val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
+    # Load val tokens and tokenizer byte LUTs (same as training)
+    val_tokens = load_validation_tokens(hparams.val_files, seq_len)
+    sp = spm.SentencePieceProcessor(model_file=hparams.tokenizer_path)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, hparams.vocab_size)
 
-    # Load artifact
-    print(f"Loading artifact: {args.artifact} ({os.path.getsize(args.artifact)/1e6:.2f} MB)")
-    artifact = load_artifact(args.artifact)
+    # =========================================================================
+    # Load models
+    # =========================================================================
 
-    # Reconstruct quantized model
-    qobj = extract_qobj(artifact)
-    qflat = dequantize_state_dict_int8(qobj)
-    model = build_model()
-    model.update(tree_unflatten(list(qflat.items())))
-    mx.eval(model.parameters())
-
-    # Reconstruct corrections
-    correction_layers, corrections = extract_corrections(artifact, hparams.model_dim)
-    print(f"Corrections: {correction_layers if correction_layers else 'none'}")
-
-    # Load float model
+    # Float model
     print(f"Loading float model: {args.float_checkpoint}")
-    flat = dict(mx.load(args.float_checkpoint))
     model_float = build_model()
+    flat = dict(mx.load(args.float_checkpoint))
     model_float.update(tree_unflatten(list(flat.items())))
     mx.eval(model_float.parameters())
 
-    # Eval
+    # Artifact model (quantized, dequantized back to float for eval)
+    print(f"Loading artifact: {args.artifact} ({os.path.getsize(args.artifact)/1e6:.2f} MB)")
+    artifact = load_artifact(args.artifact)
+    qobj = extract_qobj(artifact)
+    qflat = dequantize_state_dict_int8(qobj)
+    model_quant = build_model()
+    model_quant.update(tree_unflatten(list(qflat.items())))
+    mx.eval(model_quant.parameters())
+
+    # Corrections
+    correction_layers, corrections = extract_corrections(artifact, hparams.model_dim)
+    print(f"Corrections: {correction_layers if correction_layers else 'none'}")
+
+    # =========================================================================
+    # BPB via eval_val — identical to training script
+    # =========================================================================
+
+    def run_eval_val(model, label):
+        compiled_loss = mx.compile(
+            lambda x, y: model.loss(x, y),
+            inputs=model.state, outputs=model.state,
+        )
+        print(f"Evaluating {label}...")
+        val_loss, val_bpb = eval_val(
+            hparams, compiled_loss, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            log_fn=lambda s: print(f"  {s}"),
+        )
+        print(f"  {label}: val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
+        return val_loss, val_bpb
+
+    float_loss, float_bpb = run_eval_val(model_float, "float")
+    quant_loss, quant_bpb = run_eval_val(model_quant, "quant (no corrections)")
+
+    # =========================================================================
+    # Comparison metrics (KL, Top-1, Cos) — float vs artifact w/ corrections
+    # =========================================================================
+
     slope = hparams.lrelu_slope
     collect_set = set(correction_layers)
-    total_loss, total_tokens = 0.0, 0
     all_kl, all_top1, all_cos = [], [], []
 
-    print(f"Evaluating ({args.n_seqs} seqs)...")
-    for s in range(args.n_seqs):
-        tokens = val_tokens[s * args.seq_len: (s + 1) * args.seq_len + 1]
-        if len(tokens) < args.seq_len + 1:
-            break
-        x, y = tokens[:args.seq_len], tokens[1:args.seq_len + 1]
+    if corrections:
+        print(f"Comparing float vs corrected ({args.n_comparison_seqs} seqs)...")
+        for s in range(args.n_comparison_seqs):
+            tokens = val_tokens[s * seq_len: (s + 1) * seq_len + 1]
+            if len(tokens) < seq_len + 1:
+                break
+            x = tokens[:seq_len]
 
-        _, fh = forward_with_hidden_collection(model_float, x, slope, collect_set)
-        f_logits, _ = forward_corrected(model_float, x, slope, {}, [], fh)
-        if corrections:
-            logits, _ = forward_corrected(model, x, slope, corrections, correction_layers, fh)
-        else:
-            logits, _ = forward_corrected(model, x, slope, {}, [], fh)
-        mx.eval(f_logits, logits)
+            _, fh = forward_with_hidden_collection(model_float, x, slope, collect_set)
+            f_logits, _ = forward_corrected(model_float, x, slope, {}, [], fh)
+            logits, _ = forward_corrected(model_quant, x, slope, corrections, correction_layers, fh)
+            mx.eval(f_logits, logits)
 
-        fl = np.array(f_logits).reshape(-1, f_logits.shape[-1])
-        ql = np.array(logits).reshape(-1, logits.shape[-1])
-        tgt = y.reshape(-1)
+            fl = np.array(f_logits).reshape(-1, f_logits.shape[-1])
+            ql = np.array(logits).reshape(-1, logits.shape[-1])
 
-        fp = np.exp(fl - fl.max(-1, keepdims=True))
-        fp /= fp.sum(-1, keepdims=True)
-        qp = np.exp(ql - ql.max(-1, keepdims=True))
-        qp /= qp.sum(-1, keepdims=True)
+            fp = np.exp(fl - fl.max(-1, keepdims=True))
+            fp /= fp.sum(-1, keepdims=True)
+            qp = np.exp(ql - ql.max(-1, keepdims=True))
+            qp /= qp.sum(-1, keepdims=True)
 
-        loss = -np.log(np.maximum(qp[np.arange(len(tgt)), tgt], 1e-12))
-        total_loss += loss.sum()
-        total_tokens += len(tgt)
+            kl = (fp * np.log(np.maximum(fp, 1e-12) / np.maximum(qp, 1e-12))).sum(-1)
+            all_kl.extend(kl.tolist())
+            all_top1.extend((fl.argmax(-1) == ql.argmax(-1)).tolist())
 
-        kl = (fp * np.log(np.maximum(fp, 1e-12) / np.maximum(qp, 1e-12))).sum(-1)
-        all_kl.extend(kl.tolist())
-        all_top1.extend((fl.argmax(-1) == ql.argmax(-1)).tolist())
+            fn = fl / (np.linalg.norm(fl, -1, keepdims=True) + 1e-8)
+            qn = ql / (np.linalg.norm(ql, -1, keepdims=True) + 1e-8)
+            all_cos.extend((fn * qn).sum(-1).tolist())
 
-        fn = fl / (np.linalg.norm(fl, -1, keepdims=True) + 1e-8)
-        qn = ql / (np.linalg.norm(ql, -1, keepdims=True) + 1e-8)
-        all_cos.extend((fn * qn).sum(-1).tolist())
+    # =========================================================================
+    # Report
+    # =========================================================================
 
-    bpt = total_loss / total_tokens / math.log(2)
-    kl_arr = np.array(all_kl)
+    kl_arr = np.array(all_kl) if all_kl else np.array([0.0])
+    artifact_mb = os.path.getsize(args.artifact) / 1e6
+    fits = os.path.getsize(args.artifact) <= 16_000_000
 
     print()
     print("=== Artifact Verification ===")
-    print(f"Artifact:   {args.artifact}")
-    print(f"Size:       {os.path.getsize(args.artifact)/1e6:.2f} MB (budget: 16.00 MB)")
-    print(f"BPB:        {bpt:.4f}")
-    print(f"KL mean:    {kl_arr.mean():.6f}")
-    print(f"KL p99:     {np.percentile(kl_arr, 99):.6f}")
-    print(f"KL max:     {np.max(kl_arr):.6f}")
-    print(f"Top-1:      {np.mean(all_top1):.4f}")
-    print(f"Cos min:    {np.min(all_cos):.6f}")
-    fits = os.path.getsize(args.artifact) <= 16_000_000
-    print(f"Fits 16MB:  {'YES' if fits else 'NO'}")
+    print(f"Artifact:     {args.artifact}")
+    print(f"Size:         {artifact_mb:.2f} MB (budget: 16.00 MB)")
+    print(f"Fits 16MB:    {'YES' if fits else 'NO'}")
+    print()
+    print(f"Float BPB:    {float_bpb:.4f}")
+    print(f"Quant BPB:    {quant_bpb:.4f}  (gap: {quant_bpb - float_bpb:+.4f})")
+    print(f"Score:        {quant_bpb * artifact_mb:.4f}  (BPB x MB)")
+    if corrections:
+        print()
+        print(f"--- Correction comparison (float vs quant+corrections) ---")
+        print(f"KL mean:      {kl_arr.mean():.6f}")
+        print(f"KL p99:       {np.percentile(kl_arr, 99):.6f}")
+        print(f"KL max:       {np.max(kl_arr):.6f}")
+        print(f"Top-1 agree:  {np.mean(all_top1):.4f}")
+        print(f"Cos min:      {np.min(all_cos):.6f}")
 
 
 if __name__ == "__main__":

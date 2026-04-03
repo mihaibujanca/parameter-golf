@@ -1260,7 +1260,7 @@ def main() -> None:
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
     # ==============================================================================
-    per_layer = [int(x) for x in args.mlp_mult_per_layer.split(",") if x] if args.mlp_mult_per_layer else None
+    per_layer = [float(x) for x in args.mlp_mult_per_layer.split(",") if x] if args.mlp_mult_per_layer else None
     if per_layer and len(per_layer) != args.num_layers:
         raise ValueError(f"MLP_MULT_PER_LAYER has {len(per_layer)} entries but NUM_LAYERS={args.num_layers}")
     model = GPT(

@@ -17,5 +17,8 @@ papers/
 .claude/
 memory/
 
+# Compressed artifacts
+*.br
+
 # Local one-off scripts
 local_scripts/
