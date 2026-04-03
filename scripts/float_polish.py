@@ -252,8 +252,8 @@ def main():
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--save", action="store_true",
                         help="Save quantized artifact (pickle+zstd)")
-    parser.add_argument("--save-float", type=str, default=None,
-                        help="Save polished float weights as .npz (for downstream pipeline)")
+    parser.add_argument("--save-float", type=str, default="auto",
+                        help="Save polished float weights as .npz (default: auto-named from checkpoint)")
     parser.add_argument("--log-file", type=str, default=None)
     parser.add_argument("--n-eval-seqs", type=int, default=32)
     parser.add_argument("--filter", type=str, default=None,
@@ -357,8 +357,11 @@ def main():
         seq_len=args_cli.seq_len, batch_seqs=args_cli.batch_seqs,
     )
 
-    # Save polished float weights if requested
+    # Save polished float weights (always, unless --eval-only)
     if args_cli.save_float:
+        if args_cli.save_float == "auto":
+            stem = Path(args_cli.checkpoint).stem.replace("_best", "").replace("_mlx_model", "")
+            args_cli.save_float = f"logs/{stem}_polished.npz"
         flat_polished = dict(tree_flatten(model.state))
         mx.savez(args_cli.save_float, **flat_polished)
         log.info(f"Saved polished float weights: {args_cli.save_float}")
