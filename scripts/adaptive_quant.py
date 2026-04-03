@@ -215,6 +215,7 @@ def main():
         qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
         mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
         bigram_dim=hparams.bigram_dim,
+        num_encoder_layers=hparams.num_encoder_layers,
     )
 
     print(f"Loading checkpoint: {args_cli.checkpoint}")

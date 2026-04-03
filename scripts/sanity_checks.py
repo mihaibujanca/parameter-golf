@@ -49,6 +49,7 @@ def make_model(args: Hyperparameters, perturb_zero_init: bool = False) -> GPT:
         qk_gain_init=args.qk_gain_init,
         mlp_act=args.mlp_act,
         mlp_mult_per_layer=per_layer,
+        num_encoder_layers=args.num_encoder_layers,
     )
     if perturb_zero_init:
         # The baseline zero-inits attn.proj and mlp.proj weights, which blocks

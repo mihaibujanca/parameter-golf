@@ -67,6 +67,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 0))  # 0 = auto (num_layers // 2)
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -722,6 +723,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         mlp_act: str = "relu2",
         logit_temp: float = 1.0,
+        num_encoder_layers: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -731,10 +733,11 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.logit_temp = logit_temp
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
+        self.num_encoder_layers = num_encoder_layers if num_encoder_layers > 0 else num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_map = self._build_skip_map()
+        total_skip_connections = sum(len(s) for s in self.skip_map)
+        self.skip_weights = nn.Parameter(torch.ones(max(total_skip_connections, 1), model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -755,6 +758,39 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
+    def _build_skip_map(self) -> list[list[int]]:
+        """Build skip connection mapping: skip_map[dec_idx] = [enc_indices].
+
+        Standard U-Net when enc <= receiving decoders (1 skip each).
+        Multi-skip when enc > receiving decoders (pairs early+late encoder layers).
+        Last decoder layer gets no skip (output projection).
+        """
+        n_enc = self.num_encoder_layers
+        n_dec = self.num_decoder_layers
+        n_receiving = n_dec - 1  # last decoder = output, no skip
+
+        if n_receiving <= 0 or n_enc == 0:
+            return [[] for _ in range(n_dec)]
+
+        # Standard U-Net: enc <= receiving decoders — LIFO order
+        if n_enc <= n_receiving:
+            skip_map: list[list[int]] = [[] for _ in range(n_dec)]
+            for e in range(n_enc):
+                d = n_enc - 1 - e  # reversed: last enc -> first dec
+                skip_map[d].append(e)
+            return skip_map
+
+        # Multi-skip: more encoder layers than receiving decoder layers
+        # Pair late encoder[n_enc-1-d] with early encoder[d] for each decoder d
+        skip_map = [[] for _ in range(n_dec)]
+        for d in range(n_receiving):
+            late_enc = n_enc - 1 - d
+            skip_map[d].append(late_enc)
+            early_enc = d
+            if early_enc != late_enc:  # avoid duplicate when odd count
+                skip_map[d].append(early_enc)
+        return skip_map
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -766,15 +802,16 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
+        encoder_outputs: list[Tensor] = [None] * self.num_encoder_layers
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
-            skips.append(x)
+            encoder_outputs[i] = x
+
+        skip_idx = 0
         for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            for enc_i in self.skip_map[i]:
+                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * encoder_outputs[enc_i]
+                skip_idx += 1
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -904,6 +941,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         mlp_act=args.mlp_act,
         logit_temp=args.logit_temp,
+        num_encoder_layers=args.num_encoder_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

@@ -296,6 +296,7 @@ def main():
             bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
             lrelu_slope=hparams.lrelu_slope,
             xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
+            num_encoder_layers=hparams.num_encoder_layers,
         )
 
     cat_bits = {"attn": hparams.quant_attn_bits, "mlp": hparams.quant_mlp_bits}

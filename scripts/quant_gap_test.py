@@ -376,6 +376,7 @@ def main():
         lrelu_slope=hparams.lrelu_slope,
         xsa_last_n=hparams.xsa_last_n,
         rope_dims=hparams.rope_dims,
+        num_encoder_layers=hparams.num_encoder_layers,
     )
 
     ckpt_path = Path(args_cli.checkpoint)

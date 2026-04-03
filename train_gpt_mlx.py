@@ -83,6 +83,7 @@ class Hyperparameters:
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_encoder_layers: int = int(os.environ.get("NUM_ENCODER_LAYERS", 0))  # 0 = auto (num_layers // 2)
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -551,7 +552,8 @@ class GPT(nn.Module):
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, mlp_act: str = "relu2", mlp_mult_per_layer: list[int] | None = None,
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0,
-                 lrelu_slope: float = 0.5, xsa_last_n: int = 0, rope_dims: int = 0):
+                 lrelu_slope: float = 0.5, xsa_last_n: int = 0, rope_dims: int = 0,
+                 num_encoder_layers: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -563,10 +565,13 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(dim)
-        self.num_encoder_layers = num_layers // 2
+        self.num_encoder_layers = num_encoder_layers if num_encoder_layers > 0 else num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        # Store skip_map via object.__setattr__ to avoid MLX state serialization
+        # (MLX tree_flatten traverses list attributes and fails on plain ints)
+        object.__setattr__(self, 'skip_map', self._build_skip_map())
+        total_skip_connections = sum(len(s) for s in self.skip_map)
+        self.skip_weights = mx.ones((max(total_skip_connections, 1), dim), dtype=mx.float32)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads,
                   mlp_mult_per_layer[i] if mlp_mult_per_layer else mlp_mult,
@@ -577,6 +582,39 @@ class GPT(nn.Module):
         ]
         self.final_norm = RMSNormNoWeight()
         self._init_weights(dim, num_layers, tied_embed_init_std)
+
+    def _build_skip_map(self) -> list[list[int]]:
+        """Build skip connection mapping: skip_map[dec_idx] = [enc_indices].
+
+        Standard U-Net when enc <= receiving decoders (1 skip each).
+        Multi-skip when enc > receiving decoders (pairs early+late encoder layers).
+        Last decoder layer gets no skip (output projection).
+        """
+        n_enc = self.num_encoder_layers
+        n_dec = self.num_decoder_layers
+        n_receiving = n_dec - 1  # last decoder = output, no skip
+
+        if n_receiving <= 0 or n_enc == 0:
+            return [[] for _ in range(n_dec)]
+
+        # Standard U-Net: enc <= receiving decoders — LIFO order
+        if n_enc <= n_receiving:
+            skip_map: list[list[int]] = [[] for _ in range(n_dec)]
+            for e in range(n_enc):
+                d = n_enc - 1 - e  # reversed: last enc -> first dec
+                skip_map[d].append(e)
+            return skip_map
+
+        # Multi-skip: more encoder layers than receiving decoder layers
+        # Pair late encoder[n_enc-1-d] with early encoder[d] for each decoder d
+        skip_map = [[] for _ in range(n_dec)]
+        for d in range(n_receiving):
+            late_enc = n_enc - 1 - d
+            skip_map[d].append(late_enc)
+            early_enc = d
+            if early_enc != late_enc:  # avoid duplicate when odd count
+                skip_map[d].append(early_enc)
+        return skip_map
 
     def _init_weights(self, dim: int, num_layers: int, tied_embed_init_std: float) -> None:
         self.tok_emb.weight = (
@@ -614,14 +652,16 @@ class GPT(nn.Module):
         x = rms_norm(x)
         x = self.smear(x)
         x0 = x
-        skips: list[mx.array] = []
-
+        encoder_outputs: list[mx.array] = [None] * self.num_encoder_layers
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
-            skips.append(x)
+            encoder_outputs[i] = x
+
+        skip_idx = 0
         for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            for enc_i in self.skip_map[i]:
+                x = x + self.skip_weights[skip_idx].astype(x.dtype)[None, None, :] * encoder_outputs[enc_i]
+                skip_idx += 1
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
@@ -1314,6 +1354,7 @@ def main() -> None:
         lrelu_slope=args.lrelu_slope,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
+        num_encoder_layers=args.num_encoder_layers,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
@@ -1387,6 +1428,7 @@ def main() -> None:
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
+    log(f"unet enc:{model.num_encoder_layers} dec:{model.num_decoder_layers} skip_map:{model.skip_map} skip_weights:{model.skip_weights.shape[0]}")
     log(f"bigram:{args.bigram_vocab_size}x{args.bigram_dim} swa:{args.swa_enabled} muon_wd:{args.muon_wd} compressor:{_COMPRESSOR}")
 
     # ==============================================================================

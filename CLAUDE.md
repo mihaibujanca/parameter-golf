@@ -171,6 +171,18 @@ This produces loss curve plots (with previous-run overlay), throughput/step-time
 - The working tree may have uncommitted changes from manual editing between sessions. Don't assume HEAD is the current state — check `git status` and `git diff` before doing anything destructive.
 - When asked to separate "your changes" from existing state: your changes are what you did in this session. Everything else was already there. Use the file-history-snapshot or diff against HEAD to distinguish.
 
+## Multi-skip U-Net architecture
+
+The U-Net skip connection topology is configurable via `NUM_ENCODER_LAYERS` env var (default 0 = auto, uses `num_layers // 2`).
+
+**Standard U-Net** (enc <= dec-1): Each decoder layer gets one skip from its symmetric encoder partner in LIFO order. Last decoder gets no skip (output projection). Example: 4 enc + 5 dec -> skip_map `[[3],[2],[1],[0],[]]`.
+
+**Multi-skip** (enc > dec-1): More encoder layers than receiving decoder layers. Each decoder layer gets two skips: one late encoder (like standard U-Net) + one early encoder (symmetric partner). Example: 6 enc + 4 dec -> skip_map `[[5,0],[4,1],[3,2],[]]` — 6 total skip connections.
+
+The topology is defined by `GPT._build_skip_map()` and stored via `object.__setattr__` to avoid MLX state serialization (MLX's tree_flatten traverses lists). Skip weights are per-connection, shape `(total_skip_connections, dim)`.
+
+Cross-topology checkpoint loading is NOT supported — changing `NUM_ENCODER_LAYERS` requires retraining (different number of skip_weights).
+
 ## Mixed precision quantization & PTQ correction methodology
 
 **Two-stage analysis required for mixed precision + correction:**
