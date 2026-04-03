@@ -54,6 +54,14 @@ def main():
                         help="Save trained correction weights to this .npz path")
     parser.add_argument("--load-corrections", type=str, default=None,
                         help="Load pre-trained correction weights instead of training")
+    parser.add_argument("--polish", action="store_true",
+                        help="Run gradient polish before quantization (STE, ~500 steps)")
+    parser.add_argument("--polish-steps", type=int, default=500,
+                        help="Number of polish steps (default: 500)")
+    parser.add_argument("--polish-lr", type=float, default=1e-4,
+                        help="Polish learning rate (default: 1e-4)")
+    parser.add_argument("--batch-seqs", type=int, default=4,
+                        help="Batch size in sequences for polish (default: 4)")
     parser.add_argument("--no-permute", action="store_true",
                         help="Skip weight permutation (for comparison)")
     parser.add_argument("--compressor", choices=["brotli", "zstd", "zpaq"], default="zpaq")
@@ -149,7 +157,38 @@ def main():
         log.info(f"  → Using: best checkpoint")
         del model_swa, swa_flat
 
-    # Step 2: Quantize
+    # Step 2 (optional): Gradient polish
+    polish_bpb = None
+    if args.polish:
+        from scripts.float_polish import gradient_polish, build_param_bits_map, quantize_and_eval
+        from scripts.eval_commons import load_train_tokens
+
+        log.info(f"\n--- Gradient polish (lossy, {args.polish_steps} steps) ---")
+        train_tokens = load_train_tokens(hparams)
+        param_bits = build_param_bits_map(model_float, cat_bits)
+        log.info(f"  Polishing {len(param_bits)} weight matrices, lr={args.polish_lr}")
+        gradient_polish(model_float, train_tokens, param_bits,
+                        n_steps=args.polish_steps, lr=args.polish_lr,
+                        batch_seqs=args.batch_seqs)
+        # Update flat with polished weights
+        flat = {k: v for k, v in tree_flatten(model_float.state)}
+
+        # Measure post-polish quant BPB to show recovery
+        pre_polish_quant_bpb = None  # will compare after quantization
+        log.info("  Measuring post-polish float BPB...")
+        polish_float_bpb = measure_bpb(model_float, "polished float")
+
+        # Save polished checkpoint
+        polished_path = args.checkpoint.replace("_best.npz", "_polished.npz").replace(".npz", "_polished.npz") \
+            if "_polished" not in args.checkpoint else args.checkpoint
+        if polished_path != args.checkpoint:
+            mx.save(polished_path, dict(tree_flatten(model_float.state)))
+            log.info(f"  Saved polished checkpoint: {polished_path}")
+    else:
+        log.info("\n--- Gradient polish ---")
+        log.info("  skipped (use --polish to enable)")
+
+    # Step 3: Quantize
     log.info("\n--- Quantization (lossy) ---")
     qobj, _ = quantize_state_dict_int8(flat, cat_bits=cat_bits)
     # Measure raw quant payload size via npz serialization
@@ -346,6 +385,12 @@ def main():
     log.info(f"--- Float baseline ---")
     log.info(f"val_bpb:          {float_bpb:.4f}")
     log.info("")
+    if args.polish:
+        log.info(f"--- Gradient polish (lossy) ---")
+        log.info(f"Steps:            {args.polish_steps}, lr={args.polish_lr}")
+        log.info(f"Post-polish BPB:  {polish_float_bpb:.4f}  (Δ from float: {polish_float_bpb - float_bpb:+.4f})")
+        log.info(f"Post-polish+quant BPB: {quant_bpb:.4f}  (recovered {quant_gap - (quant_bpb - float_bpb):+.4f} vs unpolished gap)")
+        log.info("")
     log.info(f"--- Quantization (lossy) ---")
     log.info(f"Config:           {cat_bits}")
     log.info(f"Post-quant BPB:   {quant_bpb:.4f}  (gap: {quant_gap:+.4f})")
