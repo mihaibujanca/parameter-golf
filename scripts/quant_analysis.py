@@ -69,21 +69,20 @@ def per_layer_sensitivity(
                 if not cat_bits:
                     results[comp].append(0.0)
                     continue
-                # Use name-level overrides: quantize_state_dict_int8 matches
-                # exact param names before falling back to _classify_param
-                qobj, _ = quantize_state_dict_int8(flat_state, cat_bits={})
-                # Re-quantize just these specific weights at target_bits
-                qflat_base = dequantize_state_dict_int8(qobj)
-                for name in cat_bits:
+                # Quantize only the target sub-component, leave everything else float
+                modified = dict(flat_state)
+                for wname in cat_bits:
                     quant_fn = _QUANT_FN[target_bits]
-                    q, s = quant_fn(flat_state[name])
-                    dq = (q.astype(mx.float32) * s).astype(flat_state[name].dtype)
-                    qflat_base[name] = dq
-                model.update(tree_unflatten(list(qflat_base.items())))
+                    q, s = quant_fn(flat_state[wname])
+                    # dequantize: q is int8 numpy, s is float numpy
+                    import numpy as _np
+                    dq = q.astype(_np.float32) * (s[:, None] if s.ndim == 1 else s)
+                    modified[wname] = mx.array(dq.astype(_np.float32))
+                model.update(tree_unflatten(list(modified.items())))
                 mx.eval(model.parameters())
                 gap = eval_bpt_fn(model) - float_bpt
                 results[comp].append(gap)
-                del qobj, qflat_base
+                del modified
                 model.update(tree_unflatten(list(flat_state.items())))
                 mx.eval(model.parameters())
                 continue
