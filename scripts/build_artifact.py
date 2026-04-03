@@ -126,32 +126,66 @@ def main():
         log.info(f"  {label}: val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
         return val_bpb
 
-    # Step 1: Float baseline
-    log.info("Measuring float baseline...")
+    # Step 1: Float baseline + SWA comparison
+    log.info("\n--- Float baseline ---")
     model_float = build_model()
     model_float.update(tree_unflatten(list(flat.items())))
     mx.eval(model_float.parameters())
-    float_bpb = measure_bpb(model_float, "float")
+    float_bpb = measure_bpb(model_float, "float (best ckpt)")
+    float_size_mb = sum(v.size * v.itemsize for v in flat.values()) / 1e6
+
+    # Check for SWA checkpoint
+    swa_path = args.checkpoint.replace("_best.npz", "_mlx_model.npz")
+    swa_bpb = None
+    if swa_path != args.checkpoint and os.path.exists(swa_path):
+        log.info("--- SWA comparison ---")
+        swa_flat = dict(mx.load(swa_path))
+        model_swa = build_model()
+        model_swa.update(tree_unflatten(list(swa_flat.items())))
+        mx.eval(model_swa.parameters())
+        swa_bpb = measure_bpb(model_swa, "SWA")
+        swa_delta = swa_bpb - float_bpb
+        log.info(f"  SWA vs best: {swa_delta:+.4f} BPB ({'SWA hurts' if swa_delta > 0 else 'SWA helps'})")
+        log.info(f"  → Using: best checkpoint")
+        del model_swa, swa_flat
 
     # Step 2: Quantize
-    log.info("Quantizing...")
+    log.info("\n--- Quantization (lossy) ---")
     qobj, _ = quantize_state_dict_int8(flat, cat_bits=cat_bits)
+    # Measure raw quant payload size via npz serialization
+    _buf = io.BytesIO()
+    np.savez(_buf, **{k: np.array(v) if hasattr(v, '__array__') else v for k, v in qobj.items()})
+    raw_quant_mb = len(_buf.getvalue()) / 1e6
+    del _buf
 
     # Step 3: Measure quant roundtrip BPB
-    log.info("Measuring quant roundtrip...")
     qflat = dequantize_state_dict_int8(qobj)
     model_quant = build_model()
     model_quant.update(tree_unflatten(list(qflat.items())))
     mx.eval(model_quant.parameters())
     quant_bpb = measure_bpb(model_quant, "quant")
-    log.info(f"  quant_gap: {quant_bpb - float_bpb:+.4f}")
+    quant_gap = quant_bpb - float_bpb
+    log.info(f"  quant_gap: {quant_gap:+.4f} BPB")
+    log.info(f"  float: {float_size_mb:.1f} MB → raw quant: {raw_quant_mb:.1f} MB  (saved {float_size_mb - raw_quant_mb:.1f} MB)")
     del model_quant, qflat
 
-    # Weight permutation for better compression (lossless)
+    # Step 4: Weight permutation (lossless) — measure savings
+    log.info("\n--- Weight permutation (lossless) ---")
     if not args.no_permute:
         from scripts.weight_permutation import permute_mlp_qobj
-        log.info("Permuting MLP weights for compression...")
+        # Measure compressed size before permutation
+        buf_pre = io.BytesIO()
+        np.savez(buf_pre, **{k: np.array(v) if hasattr(v, '__array__') else v for k, v in qobj.items()})
+        pre_permute_raw = len(buf_pre.getvalue())
         permute_mlp_qobj(qobj)
+        buf_post = io.BytesIO()
+        np.savez(buf_post, **{k: np.array(v) if hasattr(v, '__array__') else v for k, v in qobj.items()})
+        post_permute_raw = len(buf_post.getvalue())
+        # Raw size doesn't change (permutation is reordering), but compression benefits.
+        # We'll report the actual compressed savings in the final summary.
+        log.info(f"  MLP weights permuted (lossless reordering for compression)")
+    else:
+        log.info(f"  skipped (--no-permute)")
 
     # Train or load corrections
     correction_arrays = {}
@@ -286,21 +320,56 @@ def main():
     with open(args.output, "wb") as f:
         f.write(blob)
 
+    raw_mb = len(raw) / 1e6
     artifact_mb = len(blob) / 1e6
     fits = len(blob) <= args.budget
+    score = quant_bpb * artifact_mb
+
+    corr_overhead_mb = sum(
+        np.array(v).nbytes for v in correction_arrays.values()
+    ) / 1e6 if correction_arrays else 0.0
+
     log.info("")
-    log.info("=== Artifact Summary ===")
-    log.info(f"Raw:        {len(raw)/1e6:.2f} MB")
-    log.info(f"Compressed: {artifact_mb:.2f} MB ({args.compressor})")
-    log.info(f"Budget:     {args.budget/1e6:.2f} MB")
-    log.info(f"Margin:     {(args.budget - len(blob))/1e6:+.2f} MB")
-    log.info(f"Fits:       {'YES' if fits else 'NO'}")
-    log.info(f"Saved:      {args.output}")
+    log.info("=" * 60)
+    log.info("=== Evaluation Report ===")
+    log.info("=" * 60)
+    log.info(f"Checkpoint:       {args.checkpoint}")
+    n_params = sum(v.size for v in flat.values())
+    log.info(f"Model:            {hparams.num_layers}L/{hparams.model_dim}d, MLP {hparams.mlp_mult}x {hparams.mlp_act}, {n_params/1e6:.1f}M params")
     log.info("")
-    log.info("=== BPB Tracking ===")
-    log.info(f"Float BPB:  {float_bpb:.4f}")
-    log.info(f"Quant BPB:  {quant_bpb:.4f}  (gap: {quant_bpb - float_bpb:+.4f})")
-    log.info(f"Score:      {quant_bpb * artifact_mb:.4f}  (BPB x MB)")
+    if swa_bpb is not None:
+        log.info(f"--- SWA comparison ---")
+        log.info(f"Best ckpt BPB:    {float_bpb:.4f}")
+        log.info(f"SWA ckpt BPB:     {swa_bpb:.4f}  (SWA damage: {swa_bpb - float_bpb:+.4f})")
+        log.info(f"→ Using: best checkpoint")
+        log.info("")
+    log.info(f"--- Float baseline ---")
+    log.info(f"val_bpb:          {float_bpb:.4f}")
+    log.info("")
+    log.info(f"--- Quantization (lossy) ---")
+    log.info(f"Config:           {cat_bits}")
+    log.info(f"Post-quant BPB:   {quant_bpb:.4f}  (gap: {quant_gap:+.4f})")
+    log.info(f"Float: {float_size_mb:.1f} MB → raw quant: {raw_quant_mb:.1f} MB  (saved {float_size_mb - raw_quant_mb:.1f} MB)")
+    log.info("")
+    if correction_arrays:
+        log.info(f"--- Corrections (lossy) ---")
+        log.info(f"Overhead:         {corr_overhead_mb:.2f} MB")
+        log.info("")
+    log.info(f"--- Compression (lossless) ---")
+    log.info(f"Raw payload:      {raw_mb:.2f} MB")
+    log.info(f"Compressed:       {artifact_mb:.2f} MB  (ratio {raw_mb/artifact_mb:.2f}x, {args.compressor})")
+    log.info("")
+    log.info(f"--- Final ---")
+    log.info(f"Artifact:         {artifact_mb:.2f} MB  (budget: {args.budget/1e6:.2f} MB, margin: {(args.budget - len(blob))/1e6:+.2f} MB)")
+    log.info(f"Fits:             {'YES' if fits else 'NO'}")
+    log.info(f"Artifact BPB:     {quant_bpb:.4f}")
+    log.info(f"Score:            {score:.4f}  ({quant_bpb:.4f} x {artifact_mb:.2f})")
+    log.info(f"Saved:            {args.output}")
+    log.info("")
+    log.info(f"--- Verification command ---")
+    log.info(f".venv/bin/python3 scripts/verify_artifact.py {args.output} \\")
+    log.info(f"    --float-checkpoint {args.checkpoint} \\")
+    log.info(f"    --expected-bpb {quant_bpb:.4f} --expected-float-bpb {float_bpb:.4f} --strict")
 
 
 if __name__ == "__main__":

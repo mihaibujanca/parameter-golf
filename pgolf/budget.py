@@ -248,7 +248,7 @@ def estimate_artifact_bytes(
     mlp_bits: int = 6,
     embed_fp16: bool = True,
     weight_decay: float = 0.02,
-    compression: str = "brotli",
+    compression: str = "zpaq",
     permute: bool = True,
     small_tensor_threshold: int = 65_536,
 ) -> dict:
@@ -269,7 +269,7 @@ def estimate_artifact_bytes(
     weight_decay : float
         Muon weight decay value. Higher → better compression.
     compression : str
-        "brotli" (default, brotli-11), "zpaq" (zpaq method 5), or "zstd" (zstd-22).
+        "zpaq" (default, zpaq method 5), "brotli" (brotli-11), or "zstd" (zstd-22).
     permute : bool
         If True (default), assume MLP weight permutation is applied.
     small_tensor_threshold : int
@@ -386,7 +386,7 @@ def sweep_max_layers(
     mlp_bits: int = 6,
     embed_fp16: bool = True,
     weight_decay: float = 0.02,
-    compression: str = "brotli",
+    compression: str = "zpaq",
     permute: bool = True,
     max_layers: int = 20,
 ) -> list[dict]:

@@ -30,15 +30,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def load_artifact(artifact_path: str) -> dict:
     """Load and decompress artifact, return numpy dict."""
-    raw_bytes = Path(artifact_path).read_bytes()
-    if artifact_path.endswith('.br'):
-        import brotli
-        raw = brotli.decompress(raw_bytes)
-    elif artifact_path.endswith('.zs') or artifact_path.endswith('.ptz'):
-        import zstandard
-        raw = zstandard.ZstdDecompressor().decompress(raw_bytes)
+    if artifact_path.endswith('.zp') or artifact_path.endswith('.zpaq'):
+        import subprocess, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(
+                ["/opt/homebrew/bin/zpaq", "x", artifact_path, "-to", tmpdir],
+                check=True, capture_output=True,
+            )
+            # zpaq extracts preserving path; find the .raw file
+            extracted = list(Path(tmpdir).rglob("*.raw"))
+            if not extracted:
+                # Fall back: find any file
+                extracted = [f for f in Path(tmpdir).rglob("*") if f.is_file()]
+            if not extracted:
+                raise FileNotFoundError(f"zpaq extracted no files from {artifact_path}")
+            raw = extracted[0].read_bytes()
     else:
-        raw = raw_bytes
+        raw_bytes = Path(artifact_path).read_bytes()
+        if artifact_path.endswith('.br'):
+            import brotli
+            raw = brotli.decompress(raw_bytes)
+        elif artifact_path.endswith('.zs') or artifact_path.endswith('.ptz'):
+            import zstandard
+            raw = zstandard.ZstdDecompressor().decompress(raw_bytes)
+        else:
+            raw = raw_bytes
     return dict(np.load(io.BytesIO(raw), allow_pickle=True))
 
 
@@ -103,6 +119,12 @@ def main():
                         help="Path to float checkpoint (for comparison)")
     parser.add_argument("--n-comparison-seqs", type=int, default=32,
                         help="Number of seqs for KL/Top-1/Cos comparison (default 32)")
+    parser.add_argument("--expected-bpb", type=float, default=None,
+                        help="Expected artifact BPB (for strict verification)")
+    parser.add_argument("--expected-float-bpb", type=float, default=None,
+                        help="Expected float BPB (for strict verification)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit non-zero if BPB differs by >0.0005 or artifact >16MB")
     args = parser.parse_args()
 
     import mlx.core as mx
@@ -215,18 +237,50 @@ def main():
     # =========================================================================
 
     kl_arr = np.array(all_kl) if all_kl else np.array([0.0])
-    artifact_mb = os.path.getsize(args.artifact) / 1e6
-    fits = os.path.getsize(args.artifact) <= 16_000_000
+    artifact_bytes = os.path.getsize(args.artifact)
+    artifact_mb = artifact_bytes / 1e6
+    fits = artifact_bytes <= 16_000_000
+    score = quant_bpb * artifact_mb
+
+    # Verification checks
+    checks = []
+
+    def check(name, passed, detail=""):
+        tag = "\u2713" if passed else "FAIL"
+        checks.append((name, passed, detail))
+        return tag
+
+    float_ok = True
+    quant_ok = True
+    if args.expected_float_bpb is not None:
+        float_delta = abs(float_bpb - args.expected_float_bpb)
+        float_ok = float_delta <= 0.0005
+    if args.expected_bpb is not None:
+        quant_delta = abs(quant_bpb - args.expected_bpb)
+        quant_ok = quant_delta <= 0.0005
 
     print()
-    print("=== Artifact Verification ===")
-    print(f"Artifact:     {args.artifact}")
-    print(f"Size:         {artifact_mb:.2f} MB (budget: 16.00 MB)")
-    print(f"Fits 16MB:    {'YES' if fits else 'NO'}")
+    print("=== Verification ===")
+    print(f"Artifact:         {args.artifact} ({artifact_mb:.2f} MB)")
+    raw_size_mb = sum(v.nbytes if hasattr(v, 'nbytes') else np.array(v).nbytes for v in artifact.values()) / 1e6
+    print(f"Decompress:       OK ({raw_size_mb:.2f} MB)")
+    print(f"Dequantize:       OK ({sum(v.size for _, v in tree_flatten(model_quant.parameters())) / 1e6:.1f}M params)")
     print()
-    print(f"Float BPB:    {float_bpb:.4f}")
-    print(f"Quant BPB:    {quant_bpb:.4f}  (gap: {quant_bpb - float_bpb:+.4f})")
-    print(f"Score:        {quant_bpb * artifact_mb:.4f}  (BPB x MB)")
+    if args.expected_float_bpb is not None:
+        tag = check("float_bpb", float_ok, f"Δ={abs(float_bpb - args.expected_float_bpb):.4f}")
+        print(f"Float BPB:        {float_bpb:.4f}  (expected: {args.expected_float_bpb:.4f}, Δ: {float_bpb - args.expected_float_bpb:+.4f}) {tag}")
+    else:
+        print(f"Float BPB:        {float_bpb:.4f}")
+    if args.expected_bpb is not None:
+        tag = check("artifact_bpb", quant_ok, f"Δ={abs(quant_bpb - args.expected_bpb):.4f}")
+        print(f"Artifact BPB:     {quant_bpb:.4f}  (expected: {args.expected_bpb:.4f}, Δ: {quant_bpb - args.expected_bpb:+.4f}) {tag}")
+    else:
+        print(f"Artifact BPB:     {quant_bpb:.4f}")
+    print(f"Quant gap:        {quant_bpb - float_bpb:+.4f} BPB")
+    budget_tag = check("budget", fits)
+    print(f"Fits budget:      {'YES' if fits else 'NO'} ({artifact_mb:.2f} MB ≤ 16.00 MB) {budget_tag}")
+    print(f"Score:            {score:.4f}  (BPB x MB)")
+
     if corrections:
         print()
         print(f"--- Correction comparison (float vs quant+corrections) ---")
@@ -235,6 +289,15 @@ def main():
         print(f"KL max:       {np.max(kl_arr):.6f}")
         print(f"Top-1 agree:  {np.mean(all_top1):.4f}")
         print(f"Cos min:      {np.min(all_cos):.6f}")
+
+    all_passed = all(p for _, p, _ in checks)
+    print()
+    print(f"RESULT:           {'PASS' if all_passed else 'FAIL'}")
+
+    if args.strict and not all_passed:
+        failures = [f"{n}: {d}" for n, p, d in checks if not p]
+        print(f"STRICT MODE FAILURES: {', '.join(failures)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
