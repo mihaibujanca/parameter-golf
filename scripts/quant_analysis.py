@@ -51,12 +51,42 @@ def per_layer_sensitivity(
     mx.eval(model.parameters())
     float_bpt = eval_bpt_fn(model)
 
-    results = {'attn': [], 'mlp': [], 'both': [], 'float_bpt': float_bpt}
+    components = ['attn', 'mlp', 'mlp.fc', 'mlp.proj', 'both']
+    results = {c: [] for c in components}
+    results['float_bpt'] = float_bpt
 
     for i in range(num_layers):
-        for comp in ['attn', 'mlp', 'both']:
+        for comp in components:
             if comp == 'both':
                 cat_bits = {f'attn.{i}': target_bits, f'mlp.{i}': target_bits}
+            elif comp in ('mlp.fc', 'mlp.proj'):
+                # Quantize only fc or proj weights within this layer's MLP
+                sub = 'fc' if comp == 'mlp.fc' else 'proj'
+                cat_bits = {}
+                for name in flat_state:
+                    if f'blocks.{i}.mlp.{sub}.' in name:
+                        cat_bits[name] = target_bits
+                if not cat_bits:
+                    results[comp].append(0.0)
+                    continue
+                # Use name-level overrides: quantize_state_dict_int8 matches
+                # exact param names before falling back to _classify_param
+                qobj, _ = quantize_state_dict_int8(flat_state, cat_bits={})
+                # Re-quantize just these specific weights at target_bits
+                qflat_base = dequantize_state_dict_int8(qobj)
+                for name in cat_bits:
+                    quant_fn = _QUANT_FN[target_bits]
+                    q, s = quant_fn(flat_state[name])
+                    dq = (q.astype(mx.float32) * s).astype(flat_state[name].dtype)
+                    qflat_base[name] = dq
+                model.update(tree_unflatten(list(qflat_base.items())))
+                mx.eval(model.parameters())
+                gap = eval_bpt_fn(model) - float_bpt
+                results[comp].append(gap)
+                del qobj, qflat_base
+                model.update(tree_unflatten(list(flat_state.items())))
+                mx.eval(model.parameters())
+                continue
             else:
                 cat_bits = {f'{comp}.{i}': target_bits}
             qobj, _ = quantize_state_dict_int8(flat_state, cat_bits=cat_bits)
@@ -190,9 +220,16 @@ def optimal_correction_layers(
 
 
 def print_sensitivity(sensitivity: dict, num_layers: int) -> None:
-    print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'both':>8s}")
-    for i in range(num_layers):
-        print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
+    has_fc = 'mlp.fc' in sensitivity and sensitivity['mlp.fc']
+    if has_fc:
+        print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'mlp.fc':>8s} {'mlp.proj':>8s} {'both':>8s}")
+        for i in range(num_layers):
+            print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} "
+                  f"{sensitivity['mlp.fc'][i]:>+8.4f} {sensitivity['mlp.proj'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
+    else:
+        print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'both':>8s}")
+        for i in range(num_layers):
+            print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
     print(f"\nFloat baseline: {sensitivity['float_bpt']:.4f} bpt")
 
 
