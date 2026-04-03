@@ -355,7 +355,7 @@ def main():
     )
 
     # Build model and load checkpoint
-    per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",") if x] if hparams.mlp_mult_per_layer else None
+    per_layer = [float(x) for x in hparams.mlp_mult_per_layer else None
     model = GPT(
         vocab_size=hparams.vocab_size,
         num_layers=hparams.num_layers,

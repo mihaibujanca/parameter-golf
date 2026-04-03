@@ -34,7 +34,7 @@ FAIL = "\033[91mFAIL\033[0m"
 
 
 def make_model(args: Hyperparameters, perturb_zero_init: bool = False) -> GPT:
-    per_layer = [int(x) for x in args.mlp_mult_per_layer.split(",") if x] if args.mlp_mult_per_layer else None
+    per_layer = [float(x) for x in hparams.mlp_mult_per_layer else None
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,

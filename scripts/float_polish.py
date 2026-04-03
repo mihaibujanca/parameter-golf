@@ -282,7 +282,7 @@ def main():
 
     per_layer = None
     if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
+        per_layer = [float(x) for x in hparams.mlp_mult_per_layer.split(",")]
 
     def build_model():
         return GPT(

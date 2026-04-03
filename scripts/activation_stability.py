@@ -128,7 +128,7 @@ def main():
     # Build model
     per_layer = None
     if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
+        per_layer = [float(x) for x in hparams.mlp_mult_per_layer.split(",")]
 
     model = GPT(
         vocab_size=hparams.vocab_size,

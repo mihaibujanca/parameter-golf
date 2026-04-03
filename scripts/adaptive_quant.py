@@ -206,7 +206,7 @@ def main():
         sp, hparams.vocab_size
     )
 
-    per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",") if x] if hparams.mlp_mult_per_layer else None
+    per_layer = [float(x) for x in hparams.mlp_mult_per_layer else None
     model = GPT(
         vocab_size=hparams.vocab_size, num_layers=hparams.num_layers, dim=hparams.model_dim,
         num_heads=hparams.num_heads, num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
