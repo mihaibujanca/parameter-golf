@@ -39,10 +39,11 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
-    GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
-    quantize_state_dict_int8, dequantize_state_dict_int8, load_data_shard,
+    COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
+    quantize_state_dict_int8, dequantize_state_dict_int8,
     build_sentencepiece_luts, validate_dataset_tokenizer_pair, eval_val, rms_norm,
 )
+from scripts.eval_commons import build_model, load_train_tokens
 
 log = logging.getLogger("ptq_correction")
 
@@ -171,21 +172,7 @@ def forward_corrected(model, x_tokens, slope, corrections, correction_layers, fl
 # Training
 # =============================================================================
 
-def load_train_tokens(hparams, max_tokens=1_000_000):
-    """Load a subset of train tokens for correction training."""
-    pattern = hparams.train_files
-    files = sorted(glob.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No train files: {pattern}")
-    tokens = []
-    total = 0
-    for f in files:
-        shard = load_data_shard(Path(f))
-        tokens.append(shard)
-        total += len(shard)
-        if total >= max_tokens:
-            break
-    return np.concatenate(tokens)[:max_tokens]
+# load_train_tokens imported from scripts.eval_commons (see top of file)
 
 
 def train_corrections(
@@ -324,9 +311,9 @@ def train_corrections(
 # Evaluation
 # =============================================================================
 
-def eval_corrected_bpb(model_quant, corrections, correction_layers, model_float,
+def eval_corrected_bpt(model_quant, corrections, correction_layers, model_float,
                        hparams, val_tokens, n_seqs=32, seq_len=1024):
-    """Evaluate corrected model BPB on val data."""
+    """Evaluate corrected model. NB: reports bits-per-token, NOT BPB."""
     slope = hparams.lrelu_slope
     collect_set = set(correction_layers)
 
@@ -356,10 +343,7 @@ def eval_corrected_bpb(model_quant, corrections, correction_layers, model_float,
         total_tokens += len(y)
 
     val_loss = total_loss / total_tokens
-    # Convert to BPB using the tokenizer's bytes-per-token ratio
-    # Approximate: for sp1024, ~1.06 bytes per token on average
-    # But for proper BPB we need the byte counts. Use rough estimate.
-    bits_per_token = val_loss / math.log(2)
+    bits_per_token = val_loss / math.log(2)  # NB: bits-per-token, not BPB
     log.info(f"  Corrected val_loss={val_loss:.4f} bits_per_token={bits_per_token:.4f}")
     return val_loss
 
@@ -411,24 +395,6 @@ def main():
     log.addHandler(fh)
     log.info(f"Logging to {args_cli.log_file}")
 
-    per_layer = None
-    if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
-
-    def build_model():
-        return GPT(
-            vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
-            dim=hparams.model_dim, num_heads=hparams.num_heads,
-            num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-            logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-            rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-            qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-            mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-            bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-            lrelu_slope=hparams.lrelu_slope,
-            xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
-        )
-
     # Load float model
     log.info(f"Loading checkpoint: {args_cli.checkpoint}")
     log.info(f"Config: {hparams.num_layers}L/{hparams.model_dim}d, MLP {hparams.mlp_mult}x, "
@@ -437,14 +403,14 @@ def main():
     log.info(f"Data split for training: {args_cli.data_split}"
           f"{' *** REFERENCE ONLY - DO NOT SUBMIT ***' if args_cli.data_split == 'val' else ''}")
 
-    model_float = build_model()
+    model_float = build_model(hparams)
     flat = dict(mx.load(args_cli.checkpoint))
     model_float.update(tree_unflatten(list(flat.items())))
     mx.eval(model_float.parameters())
 
     # Build quantized model
     log.info("Quantizing model...")
-    model_quant = build_model()
+    model_quant = build_model(hparams)
     cat_bits = {"attn": hparams.quant_attn_bits, "mlp": hparams.quant_mlp_bits}
     # Per-layer overrides from QUANT_BITS env var (e.g. "attn:4,mlp:5,mlp.10:4")
     quant_bits_str = os.environ.get("QUANT_BITS", "")
@@ -472,14 +438,14 @@ def main():
 
     # Baseline: uncorrected quant eval
     log.info("\n=== Baseline (no correction) ===")
-    eval_corrected_bpb(model_quant, {}, [], model_float, hparams,
+    eval_corrected_bpt(model_quant, {}, [], model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
     # Oracle correction: at correction points, replace quant hidden with float hidden
     log.info("\n=== Oracle correction (upper bound) ===")
     oracle_corrections = {}  # Empty corrections but we'll hack the forward
     # For oracle, just run float model — that gives us the upper bound
-    eval_corrected_bpb(model_float, {}, [], model_float, hparams,
+    eval_corrected_bpt(model_float, {}, [], model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
     # Train corrections
@@ -494,7 +460,7 @@ def main():
 
     # Evaluate corrected model
     log.info("\n=== Corrected model ===")
-    eval_corrected_bpb(model_quant, corrections, correction_layers, model_float, hparams,
+    eval_corrected_bpt(model_quant, corrections, correction_layers, model_float, hparams,
                        val_tokens, n_seqs=args_cli.n_eval_seqs, seq_len=args_cli.seq_len)
 
     # Report correction overhead

@@ -39,11 +39,12 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
-    GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
+    COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
     quantize_state_dict_int8, dequantize_state_dict_int8, load_data_shard,
     _classify_param, _QUANT_FN, FP16_KEEP_NAME_PATTERNS,
     CONTROL_TENSOR_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, rms_norm,
 )
+from scripts.eval_commons import build_model, quick_ce, load_train_tokens
 
 log = logging.getLogger("gptq")
 
@@ -403,58 +404,15 @@ def gptq_quantize_state_dict(flat_state: dict[str, mx.array],
 # ============================================================================
 
 def quick_eval(model, hparams, n_seqs=32, seq_len=1024):
-    """Quick CE evaluation on val tokens."""
+    """Quick CE evaluation on val tokens. NB: reports bits-per-token, NOT BPB."""
     val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
-    total_loss = 0.0
-    total_tokens = 0
-    for s in range(n_seqs):
-        tokens = val_tokens[s * seq_len : (s + 1) * seq_len + 1]
-        if len(tokens) < seq_len + 1:
-            break
-        x = mx.array(tokens[:seq_len].reshape(1, seq_len))
-        y = mx.array(tokens[1:seq_len + 1].reshape(1, seq_len))
-        loss = model.loss(x, y)
-        mx.eval(loss)
-        total_loss += loss.item() * seq_len
-        total_tokens += seq_len
-    avg = total_loss / total_tokens
-    bpb_approx = avg / math.log(2)
-    log.info(f"  val_loss={avg:.6f} ({bpb_approx:.4f} bits/tok, {n_seqs} seqs)")
+    avg = quick_ce(model, val_tokens, n_seqs, seq_len)
+    bpt = avg / math.log(2)  # NB: bits-per-token, not BPB
+    log.info(f"  val_loss={avg:.6f} ({bpt:.4f} bits/tok, {n_seqs} seqs)")
     return avg
 
 
-def build_model(hparams):
-    per_layer = None
-    if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
-    return GPT(
-        vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
-        dim=hparams.model_dim, num_heads=hparams.num_heads,
-        num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-        logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-        rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-        qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-        mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-        bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-        lrelu_slope=hparams.lrelu_slope,
-        xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
-    )
-
-
-def load_train_tokens(hparams, max_tokens=1_000_000):
-    import glob as globmod
-    files = sorted(globmod.glob(hparams.train_files))
-    if not files:
-        raise FileNotFoundError(f"No train files: {hparams.train_files}")
-    tokens = []
-    total = 0
-    for f in files:
-        shard = load_data_shard(Path(f))
-        tokens.append(shard)
-        total += len(shard)
-        if total >= max_tokens:
-            break
-    return np.concatenate(tokens)[:max_tokens]
+# build_model and load_train_tokens imported from scripts.eval_commons (see top of file)
 
 
 # ============================================================================
@@ -594,9 +552,10 @@ def main():
     recovery_pct = improvement / max(quant_gap, 1e-15) * 100
 
     log.info(f"\n=== Summary ===")
-    log.info(f"Float val_loss:    {float_loss:.6f} ({float_loss / math.log(2):.4f} bits/tok)")
-    log.info(f"RTN val_loss:      {rtn_loss:.6f} ({rtn_loss / math.log(2):.4f} bits/tok)")
-    log.info(f"GPTQ val_loss:     {gptq_loss:.6f} ({gptq_loss / math.log(2):.4f} bits/tok)")
+    log.info(f"Float val_loss:    {float_loss:.6f} ({float_loss / math.log(2):.4f} bpt)")
+    log.info(f"RTN val_loss:      {rtn_loss:.6f} ({rtn_loss / math.log(2):.4f} bpt)")
+    log.info(f"GPTQ val_loss:     {gptq_loss:.6f} ({gptq_loss / math.log(2):.4f} bpt)")
+    log.info(f"(NB: above are bits-per-token, not BPB)")
     log.info(f"RTN quant gap:     {quant_gap:.6f} CE")
     log.info(f"GPTQ quant gap:    {gptq_gap:.6f} CE")
     log.info(f"GPTQ improvement:  {improvement:.6f} CE ({recovery_pct:.1f}% of RTN gap recovered)")

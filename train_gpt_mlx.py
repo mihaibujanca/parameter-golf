@@ -57,7 +57,7 @@ class Hyperparameters:
 
     # Training loop. These defaults now mirror train_gpt.py on a single process.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
+    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     # Cap the number of val tokens evaluated (0 = full split). Useful for fast smoke tests.

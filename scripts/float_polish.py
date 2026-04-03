@@ -46,9 +46,13 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
     GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
-    quantize_state_dict_int8, dequantize_state_dict_int8, load_data_shard,
+    quantize_state_dict_int8, dequantize_state_dict_int8,
     _classify_param, CONTROL_TENSOR_NAME_PATTERNS, FP16_KEEP_NAME_PATTERNS,
     INT8_KEEP_FLOAT_MAX_NUMEL,
+)
+from scripts.eval_commons import (
+    quick_ce as _quick_ce,
+    load_train_tokens as _load_train_tokens,
 )
 
 log = logging.getLogger("float_polish")
@@ -214,22 +218,11 @@ def gradient_polish(model, train_tokens, param_bits: dict[str, int],
 # ============================================================================
 
 def quick_eval(model, hparams, n_seqs=32, seq_len=1024):
-    """Quick CE evaluation on val tokens."""
+    """Quick CE evaluation on val tokens. NB: returns CE in nats, NOT BPB."""
     val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
-    total_loss = 0.0
-    total_tokens = 0
-    for s in range(n_seqs):
-        tokens = val_tokens[s * seq_len : (s + 1) * seq_len + 1]
-        if len(tokens) < seq_len + 1:
-            break
-        x = mx.array(tokens[:seq_len].reshape(1, seq_len))
-        y = mx.array(tokens[1:seq_len + 1].reshape(1, seq_len))
-        loss = model.loss(x, y)
-        mx.eval(loss)
-        total_loss += loss.item() * seq_len
-        total_tokens += seq_len
-    avg = total_loss / total_tokens
-    log.info(f"  val_loss={avg:.6f} ({avg / math.log(2):.4f} bits/tok, {n_seqs} seqs)")
+    avg = _quick_ce(model, val_tokens, n_seqs, seq_len)
+    bpt = avg / math.log(2)  # NB: bits-per-token, not BPB
+    log.info(f"  val_loss={avg:.6f} ({bpt:.4f} bits/tok, {n_seqs} seqs)")
     return avg
 
 
@@ -244,20 +237,9 @@ def quantize_and_eval(model, cat_bits, hparams, n_seqs=32, seq_len=1024):
     return val_loss, quant_obj
 
 
+# Re-export for downstream scripts (proper_bpb_eval.py, correction_ce.py)
 def load_train_tokens(hparams, max_tokens=1_000_000):
-    import glob as globmod
-    files = sorted(globmod.glob(hparams.train_files))
-    if not files:
-        raise FileNotFoundError(f"No train files: {hparams.train_files}")
-    tokens = []
-    total = 0
-    for f in files:
-        shard = load_data_shard(Path(f))
-        tokens.append(shard)
-        total += len(shard)
-        if total >= max_tokens:
-            break
-    return np.concatenate(tokens)[:max_tokens]
+    return _load_train_tokens(hparams, max_tokens)
 
 
 def main():

@@ -1,6 +1,6 @@
-numpy
+numpy>=1.24
 tqdm
-torch
+torch>=2.0
 huggingface-hub
 kernels
 setuptools
@@ -8,3 +8,7 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
+mlx==0.31.1
+mlx-metal==0.31.1
+brotli
+zstandard

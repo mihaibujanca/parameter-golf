@@ -32,12 +32,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def per_layer_sensitivity(
     build_model_fn,
     flat_state: dict,
-    eval_bpb_fn,
+    eval_bpt_fn,
     num_layers: int,
     target_bits: int = 4,
 ) -> dict[str, list[float]]:
-    """Quantize one component at a time to target_bits, measure BPB impact.
+    """Quantize one component at a time to target_bits, measure BPT impact.
 
+    NB: eval_bpt_fn returns bits-per-token, NOT BPB.
     Returns: {'attn': [gap_per_layer], 'mlp': [gap_per_layer], 'both': [gap_per_layer]}
     """
     import mlx.core as mx
@@ -48,7 +49,7 @@ def per_layer_sensitivity(
     model = build_model_fn()
     model.update(tree_unflatten(list(flat_state.items())))
     mx.eval(model.parameters())
-    float_bpt = eval_bpb_fn(model)
+    float_bpt = eval_bpt_fn(model)
 
     results = {'attn': [], 'mlp': [], 'both': [], 'float_bpt': float_bpt}
 
@@ -62,7 +63,7 @@ def per_layer_sensitivity(
             qflat = dequantize_state_dict_int8(qobj)
             model.update(tree_unflatten(list(qflat.items())))
             mx.eval(model.parameters())
-            gap = eval_bpb_fn(model) - float_bpt
+            gap = eval_bpt_fn(model) - float_bpt
             results[comp].append(gap)
             del qobj, qflat
             # Restore float weights for next iteration
@@ -228,49 +229,23 @@ def main():
     import mlx.nn as nn
     from mlx.utils import tree_flatten, tree_unflatten
     from train_gpt_mlx import (
-        GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
+        COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
         quantize_state_dict_int8, dequantize_state_dict_int8, rms_norm,
     )
+    from scripts.eval_commons import build_model as _build_model, quick_bpt
 
     hparams = Hyperparameters()
 
     def build_model():
-        per_layer = None
-        if hparams.mlp_mult_per_layer:
-            per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
-        return GPT(
-            vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
-            dim=hparams.model_dim, num_heads=hparams.num_heads,
-            num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-            logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-            rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-            qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-            mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-            bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-            lrelu_slope=hparams.lrelu_slope,
-            xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
-        )
+        return _build_model(hparams)
 
     flat = dict(mx.load(args.checkpoint))
     val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
 
-    def eval_bpb(model, n_seqs=None):
+    def eval_bpt(model, n_seqs=None):
+        """Bits-per-token eval. NOT BPB."""
         n = n_seqs or args.n_eval_seqs
-        total_loss, total_tokens = 0.0, 0
-        for s in range(n):
-            tokens = val_tokens[s * args.seq_len: (s + 1) * args.seq_len + 1]
-            if len(tokens) < args.seq_len + 1:
-                break
-            x_arr = mx.array(tokens[:args.seq_len][np.newaxis, :])
-            h = model(x_arr)
-            logits = model._apply_logit_processing(model.tok_emb.as_linear(h))
-            logits_2d = logits.reshape(-1, logits.shape[-1])
-            targets = mx.array(tokens[1:args.seq_len + 1].reshape(-1))
-            loss = nn.losses.cross_entropy(logits_2d, targets, reduction='sum')
-            mx.eval(loss)
-            total_loss += loss.item()
-            total_tokens += args.seq_len
-        return total_loss / total_tokens / math.log(2)
+        return quick_bpt(model, val_tokens, n, args.seq_len)
 
     analysis = {'checkpoint': args.checkpoint, 'num_layers': hparams.num_layers}
 
@@ -288,7 +263,7 @@ def main():
         all_sensitivity = {}
         for tb in target_bits_list:
             print(f"\n=== Per-layer sensitivity (int{tb}) ===")
-            sens = per_layer_sensitivity(build_model, flat, eval_bpb, hparams.num_layers, target_bits=tb)
+            sens = per_layer_sensitivity(build_model, flat, eval_bpt, hparams.num_layers, target_bits=tb)
             print_sensitivity(sens, hparams.num_layers)
             all_sensitivity[tb] = sens
 

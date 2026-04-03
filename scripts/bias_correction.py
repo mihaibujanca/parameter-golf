@@ -30,51 +30,12 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
-    GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
+    COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
     quantize_state_dict_int8, dequantize_state_dict_int8, rms_norm,
 )
+from scripts.eval_commons import build_model, forward_collect_hidden
 
 log = logging.getLogger("bias_correction")
-
-
-# ============================================================================
-# Hidden state collection (same pattern as error_decomposition.py)
-# ============================================================================
-
-def forward_collect_hidden(model, tokens):
-    """Full forward collecting post-block hidden states at every layer.
-
-    Returns: list[mx.array] of length n_layers, each (1, T, D).
-    """
-    n_enc = model.num_encoder_layers
-    n_skip = model.num_skip_weights
-    n_layers = len(model.blocks)
-
-    x = mx.array(tokens[np.newaxis, :])
-    tok_emb = model.tok_emb(x).astype(COMPUTE_DTYPE)
-    if model.bigram is not None:
-        tok_emb = tok_emb + model.bigram(x)
-    x0 = model.smear(rms_norm(tok_emb))
-    h = x0
-    mx.eval(x0)
-
-    encoder_outputs = [None] * n_enc
-    hidden = []
-
-    for i in range(n_layers):
-        if i >= n_enc:
-            dec_j = i - n_enc
-            if dec_j < n_skip:
-                enc_j = n_enc - 1 - dec_j
-                if encoder_outputs[enc_j] is not None:
-                    h = h + model.skip_weights[dec_j].astype(h.dtype)[None, None, :] * encoder_outputs[enc_j]
-        h = model.blocks[i](h, x0)
-        mx.eval(h)
-        hidden.append(h)
-        if i < n_enc:
-            encoder_outputs[i] = h
-
-    return hidden
 
 
 # ============================================================================
@@ -181,7 +142,7 @@ class BiasInjectedGPT:
 
 
 def quick_eval(model_or_wrapper, hparams, n_seqs=32, seq_len=1024, label=""):
-    """Quick CE evaluation."""
+    """Quick CE evaluation. NB: reports bits-per-token, NOT BPB."""
     val_tokens = load_validation_tokens(hparams.val_files, hparams.train_seq_len)
     total_loss = 0.0
     total_tokens = 0
@@ -196,31 +157,12 @@ def quick_eval(model_or_wrapper, hparams, n_seqs=32, seq_len=1024, label=""):
         total_loss += loss.item() * seq_len
         total_tokens += seq_len
     avg = total_loss / total_tokens
-    bpb_approx = avg / math.log(2)
-    log.info(f"  {label}val_loss={avg:.6f} ({bpb_approx:.4f} bits/tok, {n_seqs} seqs)")
+    bpt = avg / math.log(2)  # NB: bits-per-token, not BPB
+    log.info(f"  {label}val_loss={avg:.6f} ({bpt:.4f} bits/tok, {n_seqs} seqs)")
     return avg
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
-def build_model(hparams):
-    per_layer = None
-    if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
-    return GPT(
-        vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
-        dim=hparams.model_dim, num_heads=hparams.num_heads,
-        num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-        logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-        rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-        qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-        mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-        bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-        lrelu_slope=hparams.lrelu_slope,
-        xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
-    )
+# build_model imported from scripts.eval_commons (see top of file)
 
 
 def main():
@@ -332,9 +274,10 @@ def main():
 
     # Summary
     log.info(f"\n=== Summary ===")
-    log.info(f"Float val_loss:     {float_loss:.6f} ({float_loss / math.log(2):.4f} bits/tok)")
-    log.info(f"Quant val_loss:     {quant_loss:.6f} ({quant_loss / math.log(2):.4f} bits/tok)")
-    log.info(f"Corrected val_loss: {corrected_loss_all:.6f} ({corrected_loss_all / math.log(2):.4f} bits/tok)")
+    log.info(f"Float val_loss:     {float_loss:.6f} ({float_loss / math.log(2):.4f} bpt)")
+    log.info(f"Quant val_loss:     {quant_loss:.6f} ({quant_loss / math.log(2):.4f} bpt)")
+    log.info(f"Corrected val_loss: {corrected_loss_all:.6f} ({corrected_loss_all / math.log(2):.4f} bpt)")
+    log.info(f"(NB: above are bits-per-token, not BPB)")
     log.info(f"Quant gap:          {quant_gap:.6f} CE")
     log.info(f"Bias improvement:   {improvement_all:.6f} CE ({recovery_all:.1f}% recovery)")
 

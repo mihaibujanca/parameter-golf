@@ -81,8 +81,8 @@ Trained checkpoint (.npz, float32, ~130MB)
 │    scripts/build_artifact.py                             │
 │                                                         │
 │    Bundle quantized weights.                            │
-│    Compress with brotli-11.                             │
-│    → Single .br file (<16MB)                            │
+│    Compress with zpaq (default) or brotli-11.           │
+│    → Single compressed file (<16MB)                     │
 │                                                         │
 │    ▶ METRIC: artifact_size_mb                           │
 └────────────────────────┬────────────────────────────────┘
@@ -113,31 +113,66 @@ Trained checkpoint (.npz, float32, ~130MB)
 | 2-3 | `scripts/quant_analysis.py` | `per_layer_sensitivity()`, `design_quant_allocation()` | checkpoint | QUANT_BITS string |
 | 4 | `train_gpt_mlx.py` | `quantize_state_dict_int8()` | checkpoint + QUANT_BITS | qobj dict + quant_bpb |
 | 5 | `scripts/weight_permutation.py` | `permute_mlp_qobj()` | qobj | qobj (mutated) |
-| 6 | `scripts/build_artifact.py` | CLI | qobj | artifact .br |
+| 6 | `scripts/build_artifact.py` | CLI | qobj | artifact (zpaq/br) |
 | 7 | `scripts/verify_artifact.py` | CLI | artifact + float checkpoint | pass/fail |
 
-## Example: Full Pipeline Run
+## Automated Pipeline
+
+Use `scripts/run_post_training_pipeline.sh` for reproducible runs:
 
 ```bash
 # Config
 export NUM_LAYERS=11 MLP_MULT=5.0 MLP_ACT=lrelu2 XSA_LAST_N=11 ROPE_DIMS=16
 CKPT=logs/warmdown_11L_5x_best.npz
 
+# Fast tier (default, ~5-10 min): eval + sensitivity + quantize + compress + verify
+./scripts/run_post_training_pipeline.sh $CKPT
+
+# With gradient polish (~12-30 min extra):
+./scripts/run_post_training_pipeline.sh $CKPT --polish
+
+# Full pipeline (polish + corrections):
+./scripts/run_post_training_pipeline.sh $CKPT --polish --corrections
+
+# On workhorse (640d models):
+./scripts/run_post_training_pipeline.sh $CKPT --polish --batch-seqs 16
+```
+
+All logs go to `logs/pipeline_<checkpoint>_<timestamp>/`.
+
+### Pipeline Tiers
+
+**Fast (default):** No training. Always runs.
+1. Float eval (`eval_bpb`)
+2. Sensitivity analysis (`quant_analysis.py`)
+3. Quantize + weight permutation
+4. Compress with zpaq
+5. Verify artifact (`eval_bpb`)
+
+**Expensive (opt-in):**
+- `--polish`: Gradient polish (`float_polish.py`, ~500 steps)
+- `--corrections`: PTQ corrections (`ptq_correction.py`)
+
+### Manual Pipeline
+
+```bash
 # Steps 1-3: Sensitivity analysis → quant allocation
 python3 scripts/quant_analysis.py $CKPT --save-analysis logs/analysis.json
-# Outputs QUANT_BITS
 
-# Steps 4-6: Build artifact (quantize + permute + compress)
+# Steps 4-6: Build artifact (quantize + permute + compress with zpaq)
 QUANT_BITS="attn:4,mlp:5,mlp.1:4,..." \
 python3 scripts/build_artifact.py $CKPT \
     --no-correction \
-    --compressor brotli \
-    --output logs/artifact.br
+    --compressor zpaq
 
 # Step 7: Verify
-python3 scripts/verify_artifact.py logs/artifact.br \
+python3 scripts/verify_artifact.py logs/artifact.zpaq \
     --float-checkpoint $CKPT
 ```
+
+### Pre-SWA vs Post-SWA
+
+SWA currently damages BPB on all tested models. Always build artifacts from `*_best.npz` (pre-SWA). If both checkpoints exist, the pipeline reports both BPB values for comparison.
 
 ## Metrics at Each Step
 

@@ -32,9 +32,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
-    GPT, COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
+    COMPUTE_DTYPE, Hyperparameters, load_validation_tokens,
     quantize_state_dict_int8, dequantize_state_dict_int8, rms_norm,
 )
+from scripts.eval_commons import build_model
 
 
 # =============================================================================
@@ -291,26 +292,11 @@ def main():
     args_cli = parser.parse_args()
 
     hparams = Hyperparameters()
-    per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")] if hparams.mlp_mult_per_layer else None
-
-    def build_model():
-        return GPT(
-            vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
-            dim=hparams.model_dim, num_heads=hparams.num_heads,
-            num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-            logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-            rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-            qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-            mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-            bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-            lrelu_slope=hparams.lrelu_slope, xsa_last_n=hparams.xsa_last_n,
-            rope_dims=hparams.rope_dims,
-        )
 
     print(f"Loading: {args_cli.checkpoint}")
     flat = dict(mx.load(args_cli.checkpoint))
 
-    model_float = build_model()
+    model_float = build_model(hparams)
     model_float.update(tree_unflatten(list(flat.items())))
     mx.eval(model_float.parameters())
 
@@ -326,7 +312,7 @@ def main():
         cat_bits = {"attn": hparams.quant_attn_bits, "mlp": hparams.quant_mlp_bits}
     quant_obj, _ = quantize_state_dict_int8(flat, cat_bits=cat_bits)
     quant_flat = dequantize_state_dict_int8(quant_obj)
-    model_quant = build_model()
+    model_quant = build_model(hparams)
     model_quant.update(tree_unflatten(list(quant_flat.items())))
     mx.eval(model_quant.parameters())
 

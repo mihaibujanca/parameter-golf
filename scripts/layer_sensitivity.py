@@ -31,26 +31,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from train_gpt_mlx import (
-    GPT, Hyperparameters, load_validation_tokens,
+    Hyperparameters, load_validation_tokens,
     quantize_state_dict_int8, dequantize_state_dict_int8,
 )
-
-
-def quick_val_loss(model, val_tokens, n_seqs=64, seq_len=1024):
-    """Fast CE evaluation on first n_seqs sequences."""
-    total_loss = 0.0
-    total_tokens = 0
-    for s in range(n_seqs):
-        start = s * seq_len
-        if start + seq_len + 1 > len(val_tokens):
-            break
-        x = mx.array(val_tokens[start:start + seq_len].reshape(1, seq_len))
-        y = mx.array(val_tokens[start + 1:start + seq_len + 1].reshape(1, seq_len))
-        loss = model.loss(x, y)
-        mx.eval(loss)
-        total_loss += loss.item() * seq_len
-        total_tokens += seq_len
-    return total_loss / total_tokens
+from scripts.eval_commons import build_model, quick_ce
 
 
 def main():
@@ -89,19 +73,7 @@ def main():
     log.info(f"Components: {args.components}, eval seqs: {args.n_eval_seqs}")
 
     # Build model
-    per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",") if x] if hparams.mlp_mult_per_layer else None
-    model = GPT(
-        vocab_size=hparams.vocab_size, num_layers=n_layers,
-        dim=hparams.model_dim, num_heads=hparams.num_heads,
-        num_kv_heads=hparams.num_kv_heads, mlp_mult=hparams.mlp_mult,
-        logit_chunk_tokens=0, logit_softcap=hparams.logit_softcap,
-        rope_base=hparams.rope_base, tied_embed_init_std=hparams.tied_embed_init_std,
-        qk_gain_init=hparams.qk_gain_init, mlp_act=hparams.mlp_act,
-        mlp_mult_per_layer=per_layer, bigram_vocab_size=hparams.bigram_vocab_size,
-        bigram_dim=hparams.bigram_dim, logit_temp=hparams.logit_temp,
-        lrelu_slope=hparams.lrelu_slope,
-        xsa_last_n=hparams.xsa_last_n, rope_dims=hparams.rope_dims,
-    )
+    model = build_model(hparams)
 
     ckpt = dict(mx.load(args.checkpoint))
     model.update(tree_unflatten(list(ckpt.items())))
@@ -114,9 +86,9 @@ def main():
 
     # Float baseline
     log.info("\n--- Float baseline (no quantization) ---")
-    float_loss = quick_val_loss(model, val_tokens, args.n_eval_seqs)
-    float_bpb = float_loss / math.log(2)
-    log.info(f"  float: loss={float_loss:.6f}  bpb={float_bpb:.4f}")
+    float_loss = quick_ce(model, val_tokens, args.n_eval_seqs)
+    float_bpt = float_loss / math.log(2)  # NB: bits-per-token, not BPB
+    log.info(f"  float: loss={float_loss:.6f}  bpt={float_bpt:.4f}")
 
     # Uniform baseline at baseline bits
     log.info(f"\n--- Uniform int{args.baseline_bits} baseline ---")
@@ -126,9 +98,9 @@ def main():
     qflat = dequantize_state_dict_int8(qobj)
     model.update(tree_unflatten(list(qflat.items())))
     mx.eval(model.state)
-    baseline_loss = quick_val_loss(model, val_tokens, args.n_eval_seqs)
-    baseline_bpb = baseline_loss / math.log(2)
-    log.info(f"  int{args.baseline_bits}: loss={baseline_loss:.6f}  bpb={baseline_bpb:.4f}  gap={baseline_bpb - float_bpb:.6f}")
+    baseline_loss = quick_ce(model, val_tokens, args.n_eval_seqs)
+    baseline_bpt = baseline_loss / math.log(2)  # NB: bits-per-token, not BPB
+    log.info(f"  int{args.baseline_bits}: loss={baseline_loss:.6f}  bpt={baseline_bpt:.4f}  gap={baseline_bpt - float_bpt:.6f}")
 
     # Per-layer sweep
     log.info(f"\n--- Per-layer sensitivity: one layer at int{args.target_bits}, rest int{args.baseline_bits} ---")
@@ -151,30 +123,30 @@ def main():
         model.update(tree_unflatten(list(qflat.items())))
         mx.eval(model.state)
 
-        loss = quick_val_loss(model, val_tokens, args.n_eval_seqs)
-        bpb = loss / math.log(2)
-        delta_from_float = bpb - float_bpb
-        delta_from_baseline = bpb - baseline_bpb
+        loss = quick_ce(model, val_tokens, args.n_eval_seqs)
+        bpt = loss / math.log(2)  # NB: bits-per-token, not BPB
+        delta_from_float = bpt - float_bpt
+        delta_from_baseline = bpt - baseline_bpt
 
         results.append({
             "layer": layer_i,
             "loss": loss,
-            "bpb": bpb,
+            "bpt": bpt,
             "delta_float": delta_from_float,
             "delta_baseline": delta_from_baseline,
         })
-        log.info(f"  L{layer_i:2d}: bpb={bpb:.4f}  Δfloat={delta_from_float:+.6f}  Δbase={delta_from_baseline:+.6f}")
+        log.info(f"  L{layer_i:2d}: bpt={bpt:.4f}  Δfloat={delta_from_float:+.6f}  Δbase={delta_from_baseline:+.6f}")
 
     # Summary sorted by sensitivity (most sensitive first)
     log.info(f"\n{'='*60}")
     log.info(f"SENSITIVITY RANKING (most sensitive → least)")
     log.info(f"{'='*60}")
-    log.info(f"{'Layer':>5s} {'BPB':>8s} {'Δ float':>10s} {'Δ baseline':>12s}")
+    log.info(f"{'Layer':>5s} {'BPT':>8s} {'Δ float':>10s} {'Δ baseline':>12s}")
     log.info(f"{'-'*5} {'-'*8} {'-'*10} {'-'*12}")
     for r in sorted(results, key=lambda x: -x["delta_float"]):
-        log.info(f"  L{r['layer']:2d}  {r['bpb']:8.4f}  {r['delta_float']:+10.6f}  {r['delta_baseline']:+12.6f}")
+        log.info(f"  L{r['layer']:2d}  {r['bpt']:8.4f}  {r['delta_float']:+10.6f}  {r['delta_baseline']:+12.6f}")
 
-    log.info(f"\nReference: float={float_bpb:.4f}, int{args.baseline_bits}={baseline_bpb:.4f}")
+    log.info(f"\nReference: float={float_bpt:.4f}, int{args.baseline_bits}={baseline_bpt:.4f} (bits-per-token, NOT BPB)")
     log.info(f"Logged to {args.log_file}")
 
 
