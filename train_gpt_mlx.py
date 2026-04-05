@@ -126,6 +126,14 @@ class Hyperparameters:
     # XSA (Exclusive Self Attention) — applied to last N layers (0 = disabled)
     xsa_last_n: int = int(os.environ.get("XSA_LAST_N", "0"))
 
+    # SpellingExpert: small local-attention block on post-smear embeddings
+    spelling_expert: bool = bool(int(os.environ.get("SPELLING_EXPERT", "0")))
+    spelling_expert_dim: int = int(os.environ.get("SPELLING_EXPERT_DIM", "160"))
+    spelling_expert_window: int = int(os.environ.get("SPELLING_EXPERT_WINDOW", "8"))
+    spelling_expert_heads: int = int(os.environ.get("SPELLING_EXPERT_HEADS", "4"))
+    spelling_expert_kv_heads: int = int(os.environ.get("SPELLING_EXPERT_KV_HEADS", "2"))
+    spelling_expert_mlp_mult: int = int(os.environ.get("SPELLING_EXPERT_MLP_MULT", "2"))
+
     # Stochastic Weight Averaging
     swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.5))
@@ -547,13 +555,78 @@ class Block(nn.Module):
         return x
 
 
+class LocalAttention(nn.Module):
+    """Single-head-group attention with an explicit boolean window mask instead of causal."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, num_kv_heads * self.head_dim)
+        self.c_v = CastedLinear(dim, num_kv_heads * self.head_dim)
+        self.proj = CastedLinear(dim, dim)
+        self.q_gain = mx.full((num_heads,), qk_gain_init, dtype=mx.float32)
+        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.scale = self.head_dim ** -0.5
+
+    def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
+        # mask: [T, T] bool — broadcast to [1, 1, T, T], convert to additive mask
+        additive = mx.where(mask[None, None, :, :], mx.zeros((1,), dtype=q.dtype),
+                            mx.full((1,), float("-inf"), dtype=q.dtype))
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=additive)
+        y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class SpellingExpert(nn.Module):
+    """Small local-attention block operating on post-smear embeddings (x0).
+
+    Projects to a reduced dim, runs local attention + MLP, then projects back.
+    proj_out is zero-initialized so the expert starts as a no-op.
+    """
+    def __init__(self, model_dim: int, expert_dim: int, num_heads: int, num_kv_heads: int,
+                 window: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.window = window
+        self.proj_in = CastedLinear(model_dim, expert_dim)
+        self.attn_norm = RMSNormNoWeight()
+        self.attn = LocalAttention(expert_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp_norm = RMSNormNoWeight()
+        self.mlp = MLP(expert_dim, mlp_mult, act="lrelu2")
+        self.proj_out = CastedLinear(expert_dim, model_dim)
+        # Zero-init proj_out so expert starts as a no-op
+        self.proj_out.weight = mx.zeros_like(self.proj_out.weight)
+
+    def __call__(self, x0: mx.array) -> mx.array:
+        T = x0.shape[1]
+        idx = mx.arange(T)
+        diff = idx[:, None] - idx[None, :]
+        mask = (diff >= 0) & (diff < self.window)  # [T, T] bool
+        h = self.proj_in(x0)
+        h = h + self.attn(self.attn_norm(h), mask)
+        h = h + self.mlp(self.mlp_norm(h))
+        return self.proj_out(h)
+
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, mlp_act: str = "relu2", mlp_mult_per_layer: list[int] | None = None,
                  bigram_vocab_size: int = 0, bigram_dim: int = 128, logit_temp: float = 1.0,
                  lrelu_slope: float = 0.5, xsa_last_n: int = 0, rope_dims: int = 0,
-                 num_encoder_layers: int = 0):
+                 num_encoder_layers: int = 0, spelling_expert: bool = False,
+                 spelling_expert_dim: int = 160, spelling_expert_window: int = 8,
+                 spelling_expert_heads: int = 4, spelling_expert_kv_heads: int = 2,
+                 spelling_expert_mlp_mult: int = 2):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -581,6 +654,15 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        if spelling_expert:
+            self.spelling_expert = SpellingExpert(
+                model_dim=dim, expert_dim=spelling_expert_dim,
+                num_heads=spelling_expert_heads, num_kv_heads=spelling_expert_kv_heads,
+                window=spelling_expert_window, mlp_mult=spelling_expert_mlp_mult,
+                rope_base=rope_base, qk_gain_init=qk_gain_init,
+            )
+        else:
+            self.spelling_expert = None
         self._init_weights(dim, num_layers, tied_embed_init_std)
 
     def _build_skip_map(self) -> list[list[int]]:
@@ -640,6 +722,16 @@ class GPT(nn.Module):
                     q, _ = np.linalg.qr(a if a.shape[0] >= a.shape[1] else a.T)
                     q = q[:w.shape[0], :w.shape[1]] if a.shape[0] >= a.shape[1] else q[:w.shape[1], :w.shape[0]].T
                     b.mlp.gate.weight = mx.array(q, dtype=w.dtype)
+        if self.spelling_expert is not None:
+            se = self.spelling_expert
+            for mod in [se.proj_in, se.attn.c_q, se.attn.c_k, se.attn.c_v, se.attn.proj, se.mlp.fc, se.mlp.proj]:
+                w = mod.weight
+                if w.ndim == 2 and min(w.shape) >= 64:
+                    a = np.random.randn(w.shape[0], w.shape[1]).astype(np.float32)
+                    q, _ = np.linalg.qr(a if a.shape[0] >= a.shape[1] else a.T)
+                    q = q[:w.shape[0], :w.shape[1]] if a.shape[0] >= a.shape[1] else q[:w.shape[1], :w.shape[0]].T
+                    mod.weight = mx.array(q, dtype=w.dtype)
+            # proj_out stays zero (initialized in SpellingExpert.__init__)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -663,7 +755,10 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[skip_idx].astype(x.dtype)[None, None, :] * encoder_outputs[enc_i]
                 skip_idx += 1
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-        return self.final_norm(x)
+        x = self.final_norm(x)
+        if self.spelling_expert is not None:
+            x = x + self.spelling_expert(x0)
+        return x
 
     def _apply_logit_processing(self, logits: mx.array) -> mx.array:
         logits = self.softcap(logits)
@@ -1355,6 +1450,12 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         num_encoder_layers=args.num_encoder_layers,
+        spelling_expert=args.spelling_expert,
+        spelling_expert_dim=args.spelling_expert_dim,
+        spelling_expert_window=args.spelling_expert_window,
+        spelling_expert_heads=args.spelling_expert_heads,
+        spelling_expert_kv_heads=args.spelling_expert_kv_heads,
+        spelling_expert_mlp_mult=args.spelling_expert_mlp_mult,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
