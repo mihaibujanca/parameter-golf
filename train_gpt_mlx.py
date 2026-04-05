@@ -126,13 +126,14 @@ class Hyperparameters:
     # XSA (Exclusive Self Attention) — applied to last N layers (0 = disabled)
     xsa_last_n: int = int(os.environ.get("XSA_LAST_N", "0"))
 
-    # SpellingExpert: small local-attention block on post-smear embeddings
+    # SpellingExpert: small local-attention block for subword/spelling patterns
     spelling_expert: bool = bool(int(os.environ.get("SPELLING_EXPERT", "0")))
     spelling_expert_dim: int = int(os.environ.get("SPELLING_EXPERT_DIM", "160"))
     spelling_expert_window: int = int(os.environ.get("SPELLING_EXPERT_WINDOW", "8"))
     spelling_expert_heads: int = int(os.environ.get("SPELLING_EXPERT_HEADS", "4"))
     spelling_expert_kv_heads: int = int(os.environ.get("SPELLING_EXPERT_KV_HEADS", "2"))
     spelling_expert_mlp_mult: int = int(os.environ.get("SPELLING_EXPERT_MLP_MULT", "2"))
+    spelling_expert_input: str = os.environ.get("SPELLING_EXPERT_INPUT", "encoder")  # "x0" or "encoder"
 
     # Stochastic Weight Averaging
     swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
@@ -626,7 +627,7 @@ class GPT(nn.Module):
                  num_encoder_layers: int = 0, spelling_expert: bool = False,
                  spelling_expert_dim: int = 160, spelling_expert_window: int = 8,
                  spelling_expert_heads: int = 4, spelling_expert_kv_heads: int = 2,
-                 spelling_expert_mlp_mult: int = 2):
+                 spelling_expert_mlp_mult: int = 2, spelling_expert_input: str = "encoder"):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -663,6 +664,7 @@ class GPT(nn.Module):
             )
         else:
             self.spelling_expert = None
+        object.__setattr__(self, 'spelling_expert_input', spelling_expert_input)
         self._init_weights(dim, num_layers, tied_embed_init_std)
 
     def _build_skip_map(self) -> list[list[int]]:
@@ -757,7 +759,8 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x)
         if self.spelling_expert is not None:
-            x = x + self.spelling_expert(x0)
+            se_input = encoder_outputs[-1] if self.spelling_expert_input == "encoder" else x0
+            x = x + self.spelling_expert(se_input)
         return x
 
     def _apply_logit_processing(self, logits: mx.array) -> mx.array:
@@ -1456,6 +1459,7 @@ def main() -> None:
         spelling_expert_heads=args.spelling_expert_heads,
         spelling_expert_kv_heads=args.spelling_expert_kv_heads,
         spelling_expert_mlp_mult=args.spelling_expert_mlp_mult,
+        spelling_expert_input=args.spelling_expert_input,
     )
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
