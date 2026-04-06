@@ -99,15 +99,24 @@ def build_param_bits_map(model, cat_bits: dict[str, int],
         if filter_pattern and not re.search(filter_pattern, name):
             continue
         cat = _classify_param(name)
+        # Build lookup chain: same logic as quantize_state_dict_int8.
+        # For "mlp.fc.N": try "mlp.fc.N" → "mlp.N" → "mlp.fc" → "mlp".
+        keys_to_try = [cat]
+        m = re.match(r"mlp\.(fc|proj)\.(\d+)$", cat)
+        if m:
+            keys_to_try.append(f"mlp.{m.group(2)}")
+            keys_to_try.append("mlp.fc" if m.group(1) == "fc" else "mlp.proj")
+            keys_to_try.append("mlp")
+        else:
+            key = cat
+            while "." in key:
+                key = key.rsplit(".", 1)[0]
+                keys_to_try.append(key)
         bits = None
-        key = cat
-        while bits is None and key:
+        for key in keys_to_try:
             bits = cat_bits.get(key)
             if bits is not None:
                 break
-            if "." not in key:
-                break
-            key = key.rsplit(".", 1)[0]
         if bits is None:
             bits = 8
         param_bits[name] = bits
@@ -289,7 +298,7 @@ def main():
 
     per_layer = None
     if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
+        per_layer = [float(x) for x in hparams.mlp_mult_per_layer.split(",")]
 
     def build_model():
         return GPT(

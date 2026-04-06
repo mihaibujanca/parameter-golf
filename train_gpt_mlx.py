@@ -164,6 +164,14 @@ class Hyperparameters:
     # 1.0 disables (uniform weighting, identical to unweighted mean).
     continuation_loss_weight: float = float(os.environ.get("CONTINUATION_LOSS_WEIGHT", "1.0"))
 
+    # Boundary-masked training loss. When 1, the training CE is computed over
+    # logits masked to the correct side of the word boundary (continuation-only
+    # softmax if target is a continuation, word-start-only otherwise). Simulates
+    # a perfect word-boundary oracle during training. Val BPB is ALWAYS reported
+    # under both the pristine softmax (val_bpb, the competition metric) and the
+    # boundary-masked softmax (val_bpb_masked), regardless of this flag.
+    boundary_masked_loss: bool = bool(int(os.environ.get("BOUNDARY_MASKED_LOSS", "0")))
+
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     @property
@@ -638,7 +646,9 @@ class GPT(nn.Module):
                  spelling_expert_dim: int = 160, spelling_expert_window: int = 8,
                  spelling_expert_heads: int = 4, spelling_expert_kv_heads: int = 2,
                  spelling_expert_mlp_mult: int = 2, spelling_expert_input: str = "encoder",
-                 aux_loss_weight: float = 0.0, token_loss_weights: mx.array | None = None):
+                 aux_loss_weight: float = 0.0, token_loss_weights: mx.array | None = None,
+                 boundary_mask_lut: mx.array | None = None,
+                 boundary_masked_train_loss: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -654,6 +664,18 @@ class GPT(nn.Module):
         # it, but SplitOptimizers filters 'token_loss_weights' out of trainable keys.
         if token_loss_weights is not None:
             self.token_loss_weights = token_loss_weights
+        # boundary_mask_lut: shape (vocab_size,) bool. True at positions of
+        # continuation tokens (pieces that do NOT start with ▁ AND are not
+        # boundary/special tokens). Used by loss_masked() / train_loss() when
+        # boundary_masked_train_loss is enabled. Same state-capture pattern as
+        # token_loss_weights — stored on self so mx.compile sees it, filtered
+        # out of SplitOptimizers.
+        if boundary_mask_lut is not None:
+            self.boundary_mask_lut = boundary_mask_lut
+        # Whether train_loss applies the boundary mask. Plain python bool so
+        # tree_flatten leaves it alone.
+        object.__setattr__(self, 'boundary_masked_train_loss',
+                           bool(boundary_masked_train_loss))
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim) if bigram_vocab_size > 0 else None
@@ -829,7 +851,10 @@ class GPT(nn.Module):
         # Training-time loss: adds H1 (aux encoder CE) and H2 (continuation token
         # upweighting) on top of the standard CE. Defaults to identical output
         # to loss() when aux_loss_weight == 0.0 and token_loss_weights is None.
+        # When boundary_masked_train_loss is True, logits are boundary-masked
+        # before CE (training-time word-boundary oracle).
         aux_weight = float(getattr(self, "aux_loss_weight", 0.0))
+        use_boundary_mask = bool(getattr(self, "boundary_masked_train_loss", False))
         if aux_weight > 0.0:
             x_full, enc_out = self(input_ids, return_encoder_output=True)
         else:
@@ -840,6 +865,8 @@ class GPT(nn.Module):
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
+            if use_boundary_mask:
+                logits = self._apply_boundary_mask(logits, y)
             main_loss = self._mean_ce_weighted_or_plain(logits, y)
         else:
             loss_sum = mx.array(0.0, dtype=mx.float32)
@@ -847,6 +874,8 @@ class GPT(nn.Module):
             for s in range(0, n, self.logit_chunk_tokens):
                 e = min(s + self.logit_chunk_tokens, n)
                 logits = self._apply_logit_processing(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
+                if use_boundary_mask:
+                    logits = self._apply_boundary_mask(logits, y[s:e])
                 loss_sum = loss_sum + self._sum_ce_weighted_or_plain(logits, y[s:e])
             main_loss = loss_sum / float(n)
 
@@ -854,9 +883,12 @@ class GPT(nn.Module):
             # Deep supervision: project last encoder output through tied
             # embeddings and add its CE. Same softcap/temp as the main head.
             # Uses the same (possibly weighted) CE so both heads see the same
-            # per-token weighting.
+            # per-token weighting. The boundary mask is applied here too when
+            # enabled, so the aux head learns the same masked objective.
             e = rms_norm(enc_out).reshape(-1, dim)
             aux_logits = self._apply_logit_processing(e @ self.tok_emb.weight.astype(e.dtype).T)
+            if use_boundary_mask:
+                aux_logits = self._apply_boundary_mask(aux_logits, y)
             aux_loss = self._mean_ce_weighted_or_plain(aux_logits, y)
             return main_loss + aux_weight * aux_loss
         return main_loss
@@ -867,6 +899,46 @@ class GPT(nn.Module):
         y = target_ids[:, -n:].reshape(-1)
         logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
         return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+    def _apply_boundary_mask(self, logits: mx.array, y: mx.array) -> mx.array:
+        """Mask logits to the correct side of the word boundary for each target.
+
+        Given per-position targets y and the boundary LUT (True for continuation
+        tokens), build a per-position keep mask [N, V] that is True on the SAME
+        side as y[n], and set logits off-side to -inf. Subsequent CE over these
+        masked logits is equivalent to a softmax restricted to the correct side.
+        """
+        lut = self.boundary_mask_lut  # [V] bool, True for continuations
+        target_is_cont = lut[y]  # [N] bool
+        # keep[n, v] = lut[v] if target_is_cont[n] else ~lut[v]
+        keep = mx.where(
+            target_is_cont[:, None],
+            mx.broadcast_to(lut[None, :], (y.shape[0], lut.shape[0])),
+            mx.broadcast_to((~lut)[None, :], (y.shape[0], lut.shape[0])),
+        )
+        neg_inf = mx.array(float("-inf"), dtype=logits.dtype)
+        return mx.where(keep, logits, neg_inf)
+
+    def loss_masked(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        """Same structure as loss() but CE is computed over logits that have
+        been boundary-masked per _apply_boundary_mask. Used as the 'oracle-BPB'
+        val metric and also as the training objective when
+        boundary_masked_train_loss is set."""
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
+            logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
+            logits = self._apply_boundary_mask(logits, y)
+            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+        loss_sum = mx.array(0.0, dtype=mx.float32)
+        n = int(x.shape[0])
+        for s in range(0, n, self.logit_chunk_tokens):
+            e = min(s + self.logit_chunk_tokens, n)
+            logits = self._apply_logit_processing(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
+            logits = self._apply_boundary_mask(logits, y[s:e])
+            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
+        return loss_sum / float(n)
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -918,10 +990,11 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
-        # token_loss_weights is a constant LUT, not a learned parameter. It sits
-        # in model.state so mx.compile can capture it, but it must be excluded
-        # from every optimizer group.
-        params = {k: v for k, v in params.items() if "token_loss_weights" not in k}
+        # token_loss_weights and boundary_mask_lut are constant LUTs, not
+        # learned parameters. They sit in model.state so mx.compile can capture
+        # them, but they must be excluded from every optimizer group.
+        params = {k: v for k, v in params.items()
+                  if "token_loss_weights" not in k and "boundary_mask_lut" not in k}
         self.embed_keys = ["tok_emb.weight"]
         # BigramHash embed.weight uses the same Adam group as tok_emb
         if "bigram.embed.weight" in params:
@@ -954,8 +1027,10 @@ class SplitOptimizers:
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
         params = dict(tree_flatten(model.parameters()))
-        # Keep token_loss_weights out of the update dict — it's a frozen LUT.
-        params = {k: v for k, v in params.items() if "token_loss_weights" not in k}
+        # Keep the constant LUTs (token_loss_weights, boundary_mask_lut) out of
+        # the update dict — they are frozen.
+        params = {k: v for k, v in params.items()
+                  if "token_loss_weights" not in k and "boundary_mask_lut" not in k}
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
 
@@ -1177,16 +1252,29 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
         # Walk cat_bits fallback chain from most specific to least.
-        # e.g. "mlp.proj.12" → "mlp.proj" → "mlp"; "attn.12" → "attn"
+        # For "mlp.proj.12" the walk is: "mlp.proj.12" → "mlp.12" (whole-MLP per-layer
+        # alias) → "mlp.proj" (sub-component) → "mlp" (category).
+        # For "attn.12": "attn.12" → "attn".
         bits = None
-        key = cat
-        while bits is None and key:
+        keys_to_try = [cat]
+        # Add the "mlp.N" alias for "mlp.fc.N" / "mlp.proj.N" so per-layer
+        # MLP overrides like {"mlp.4": 4} apply to both fc and proj of layer 4.
+        import re as _re
+        m = _re.match(r"mlp\.(fc|proj)\.(\d+)$", cat)
+        if m:
+            keys_to_try.append(f"mlp.{m.group(2)}")  # "mlp.4"
+            keys_to_try.append("mlp.fc" if m.group(1) == "fc" else "mlp.proj")
+            keys_to_try.append("mlp")
+        else:
+            # Generic walk: "attn.12" → "attn", "bigram" stays
+            key = cat
+            while "." in key:
+                key = key.rsplit(".", 1)[0]
+                keys_to_try.append(key)
+        for key in keys_to_try:
             bits = (cat_bits or {}).get(key)
             if bits is not None:
                 break
-            if "." not in key:
-                break
-            key = key.rsplit(".", 1)[0]
         if bits is None:
             base_cat = cat.split(".")[0]
             bits = 6 if base_cat in int6_cats else 8
@@ -1537,15 +1625,19 @@ def main() -> None:
     # its sentencepiece piece does NOT start with ▁ (leading space) AND it is
     # not a special/boundary token. We build a mean-1 weight vector so overall
     # loss magnitude stays comparable to the unweighted case.
+    is_continuation_lut_np = (~has_leading_space_lut) & (~is_boundary_token_lut)
     token_loss_weights_mx: mx.array | None = None
     if args.continuation_loss_weight != 1.0:
-        is_continuation_lut = (~has_leading_space_lut) & (~is_boundary_token_lut)
-        w_np = np.where(is_continuation_lut, args.continuation_loss_weight, 1.0).astype(np.float32)
+        w_np = np.where(is_continuation_lut_np, args.continuation_loss_weight, 1.0).astype(np.float32)
         # Normalize so mean over the vocab is 1.0. (Per-batch normalization would
         # make the loss scale data-dependent; vocab-mean normalization keeps it
         # static.)
         w_np = w_np * (w_np.size / w_np.sum())
         token_loss_weights_mx = mx.array(w_np, dtype=mx.float32)
+    # Boundary mask LUT is always built (small, ~vocab_size bools). It's used
+    # by the masked val BPB metric (always reported) and by train_loss when
+    # BOUNDARY_MASKED_LOSS is set.
+    boundary_mask_lut_mx = mx.array(is_continuation_lut_np, dtype=mx.bool_)
 
     model = GPT(
         vocab_size=args.vocab_size,
@@ -1577,6 +1669,8 @@ def main() -> None:
         spelling_expert_input=args.spelling_expert_input,
         aux_loss_weight=args.aux_loss_weight,
         token_loss_weights=token_loss_weights_mx,
+        boundary_mask_lut=boundary_mask_lut_mx,
+        boundary_masked_train_loss=args.boundary_masked_loss,
     )
     # token_loss_weights sits in model.state so mx.compile can capture it, but
     # SplitOptimizers filters the name out of every optimizer group, so it is
@@ -1598,6 +1692,12 @@ def main() -> None:
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    # Second val head: CE under the boundary-masked softmax. Used to report
+    # val_bpb_masked alongside the pristine val_bpb at every eval step, so we
+    # can compare baseline vs boundary-masked training under matched metrics.
+    compiled_loss_masked = mx.compile(
+        lambda x, y: model.loss_masked(x, y), inputs=model.state, outputs=model.state
+    )
     # Training uses model.train_loss, which adds aux encoder CE and continuation
     # upweighting when enabled. model.loss stays unweighted so val_bpb is always
     # the true CE metric regardless of the spelling experiments.
@@ -1734,12 +1834,28 @@ def main() -> None:
                 log_fn=log,
                 compiled_sliding_loss=compiled_sliding_loss,
             )
+            # Second pass: masked val BPB under the boundary oracle. Uses
+            # compiled_loss_masked (no sliding window — masked eval is a
+            # separate metric, not a replacement for the pristine val BPB).
+            val_loss_masked, val_bpb_masked = eval_val(
+                args,
+                compiled_loss_masked,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+                log_fn=None,
+                compiled_sliding_loss=None,
+            )
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"val_bpb_masked:{val_bpb_masked:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
-            jlog({"step": step, "val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": train_time_ms})
+            jlog({"step": step, "val_loss": val_loss, "val_bpb": val_bpb,
+                  "val_loss_masked": val_loss_masked, "val_bpb_masked": val_bpb_masked,
+                  "train_time_ms": train_time_ms})
             if val_bpb < best_val_bpb and step > 0:
                 best_val_bpb = val_bpb
                 best_ckpt_path = out_dir / f"{args.run_id}_best.npz"
@@ -1856,7 +1972,18 @@ def main() -> None:
         log_fn=log,
         compiled_sliding_loss=compiled_sliding_loss,
     )
-    log(f"pre_quant val_loss:{pre_val_loss:.4f} val_bpb:{pre_val_bpb:.4f}")
+    pre_val_loss_masked, pre_val_bpb_masked = eval_val(
+        args,
+        compiled_loss_masked,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        log_fn=None,
+        compiled_sliding_loss=None,
+    )
+    log(f"pre_quant val_loss:{pre_val_loss:.4f} val_bpb:{pre_val_bpb:.4f} "
+        f"val_bpb_masked:{pre_val_bpb_masked:.4f}")
 
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
@@ -1928,6 +2055,8 @@ def main() -> None:
         "run_id": args.run_id,
         "val_loss_pre_quant": pre_val_loss,
         "val_bpb_pre_quant": pre_val_bpb,
+        "val_loss_pre_quant_masked": pre_val_loss_masked,
+        "val_bpb_pre_quant_masked": pre_val_bpb_masked,
         "val_loss": q_val_loss,
         "val_bpb": q_val_bpb,
         "quant_gap_bpb": q_val_bpb - pre_val_bpb,
