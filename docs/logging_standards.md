@@ -26,6 +26,15 @@ Every training run emits to `logs/`:
 | `{run_id}_mlx_model.npz` | Final model (SWA if enabled) | Yes |
 | `{run_id}_step{N}.npz` | Periodic checkpoint | If CHECKPOINT_EVERY > 0 |
 
+Gradient polish emits:
+
+| File | Contents |
+|------|----------|
+| `{run_id}_polished.npz` | Polished float weights (**always saved**, auto-named) |
+| `polish_{description}.txt` | Polish log with baseline/polished quant loss, recovery % |
+
+Polish always saves the polished checkpoint. There is no opt-out. The output path can be overridden with `--save-float <path>`.
+
 Post-training pipeline adds to `logs/pipeline_{run_id}_{timestamp}/`:
 
 | File | Contents |

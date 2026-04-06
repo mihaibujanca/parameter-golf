@@ -43,7 +43,7 @@ def per_layer_sensitivity(
     """
     import mlx.core as mx
     from mlx.utils import tree_unflatten
-    from train_gpt_mlx import quantize_state_dict_int8, dequantize_state_dict_int8
+    from train_gpt_mlx import quantize_state_dict_int8, dequantize_state_dict_int8, _QUANT_FN
 
     # Float baseline
     model = build_model_fn()
@@ -51,25 +51,43 @@ def per_layer_sensitivity(
     mx.eval(model.parameters())
     float_bpt = eval_bpt_fn(model)
 
-    results = {'attn': [], 'mlp': [], 'both': [], 'float_bpt': float_bpt}
+    components = ['attn', 'mlp', 'mlp.fc', 'mlp.proj', 'both']
+    results = {c: [] for c in components}
+    results['float_bpt'] = float_bpt
 
     for i in range(num_layers):
-        for comp in ['attn', 'mlp', 'both']:
-            # _classify_param returns 'mlp.fc.N' / 'mlp.proj.N' / 'attn.N'.
-            # The walk-up chain never tries 'mlp.N', so we expand it explicitly.
+        for comp in components:
             if comp == 'both':
-                cat_bits = {
-                    f'attn.{i}': target_bits,
-                    f'mlp.fc.{i}': target_bits,
-                    f'mlp.proj.{i}': target_bits,
-                }
-            elif comp == 'mlp':
-                cat_bits = {
-                    f'mlp.fc.{i}': target_bits,
-                    f'mlp.proj.{i}': target_bits,
-                }
-            else:  # 'attn'
-                cat_bits = {f'attn.{i}': target_bits}
+                cat_bits = {f'attn.{i}': target_bits, f'mlp.{i}': target_bits}
+            elif comp in ('mlp.fc', 'mlp.proj'):
+                # Quantize only fc or proj weights within this layer's MLP
+                sub = 'fc' if comp == 'mlp.fc' else 'proj'
+                cat_bits = {}
+                for name in flat_state:
+                    if f'blocks.{i}.mlp.{sub}.' in name:
+                        cat_bits[name] = target_bits
+                if not cat_bits:
+                    results[comp].append(0.0)
+                    continue
+                # Quantize only the target sub-component, leave everything else float
+                modified = dict(flat_state)
+                for wname in cat_bits:
+                    quant_fn = _QUANT_FN[target_bits]
+                    q, s = quant_fn(flat_state[wname])
+                    # dequantize: q is int8 numpy, s is float numpy
+                    import numpy as _np
+                    dq = q.astype(_np.float32) * (s[:, None] if s.ndim == 1 else s)
+                    modified[wname] = mx.array(dq.astype(_np.float32))
+                model.update(tree_unflatten(list(modified.items())))
+                mx.eval(model.parameters())
+                gap = eval_bpt_fn(model) - float_bpt
+                results[comp].append(gap)
+                del modified
+                model.update(tree_unflatten(list(flat_state.items())))
+                mx.eval(model.parameters())
+                continue
+            else:
+                cat_bits = {f'{comp}.{i}': target_bits}
             qobj, _ = quantize_state_dict_int8(flat_state, cat_bits=cat_bits)
             qflat = dequantize_state_dict_int8(qobj)
             model.update(tree_unflatten(list(qflat.items())))
@@ -205,9 +223,16 @@ def optimal_correction_layers(
 
 
 def print_sensitivity(sensitivity: dict, num_layers: int) -> None:
-    print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'both':>8s}")
-    for i in range(num_layers):
-        print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
+    has_fc = 'mlp.fc' in sensitivity and sensitivity['mlp.fc']
+    if has_fc:
+        print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'mlp.fc':>8s} {'mlp.proj':>8s} {'both':>8s}")
+        for i in range(num_layers):
+            print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} "
+                  f"{sensitivity['mlp.fc'][i]:>+8.4f} {sensitivity['mlp.proj'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
+    else:
+        print(f"\n{'Layer':>6s} {'attn':>8s} {'mlp':>8s} {'both':>8s}")
+        for i in range(num_layers):
+            print(f"{i:>6d} {sensitivity['attn'][i]:>+8.4f} {sensitivity['mlp'][i]:>+8.4f} {sensitivity['both'][i]:>+8.4f}")
     print(f"\nFloat baseline: {sensitivity['float_bpt']:.4f} bpt")
 
 

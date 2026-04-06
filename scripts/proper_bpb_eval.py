@@ -71,7 +71,7 @@ def proper_bpb_eval(model, hparams, val_tokens, sp_luts, max_tokens=1_048_576):
 def build_model(hparams):
     per_layer = None
     if hparams.mlp_mult_per_layer:
-        per_layer = [int(x) for x in hparams.mlp_mult_per_layer.split(",")]
+        per_layer = [float(x) for x in hparams.mlp_mult_per_layer.split(",")]
     return GPT(
         vocab_size=hparams.vocab_size, num_layers=hparams.num_layers,
         dim=hparams.model_dim, num_heads=hparams.num_heads,
