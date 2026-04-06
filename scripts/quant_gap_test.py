@@ -194,8 +194,16 @@ def quantize_configurable(
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
 
-        # Determine bit-width for this param (per-layer override, then category)
-        bits = (per_layer_bits or {}).get(cat)
+        # Walk per_layer_bits fallback chain (most specific → least)
+        bits = None
+        key = cat
+        while bits is None and key:
+            bits = (per_layer_bits or {}).get(key)
+            if bits is not None:
+                break
+            if "." not in key:
+                break
+            key = key.rsplit(".", 1)[0]
         if bits is None:
             base_cat = cat.split(".")[0]
             if base_cat == "attn":

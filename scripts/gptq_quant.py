@@ -342,10 +342,15 @@ def gptq_quantize_state_dict(flat_state: dict[str, mx.array],
 
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
-        bits = (cat_bits or {}).get(cat)
-        if bits is None:
-            base_cat = cat.split(".")[0]
-            bits = (cat_bits or {}).get(base_cat)
+        bits = None
+        key = cat
+        while bits is None and key:
+            bits = (cat_bits or {}).get(key)
+            if bits is not None:
+                break
+            if "." not in key:
+                break
+            key = key.rsplit(".", 1)[0]
         if bits is None:
             bits = 8
         qmax = _BITS_TO_QMAX[bits]

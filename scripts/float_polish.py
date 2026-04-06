@@ -99,10 +99,17 @@ def build_param_bits_map(model, cat_bits: dict[str, int],
         if filter_pattern and not re.search(filter_pattern, name):
             continue
         cat = _classify_param(name)
-        bits = cat_bits.get(cat)
+        bits = None
+        key = cat
+        while bits is None and key:
+            bits = cat_bits.get(key)
+            if bits is not None:
+                break
+            if "." not in key:
+                break
+            key = key.rsplit(".", 1)[0]
         if bits is None:
-            base_cat = cat.split(".")[0]
-            bits = cat_bits.get(base_cat, 8)
+            bits = 8
         param_bits[name] = bits
     return param_bits
 

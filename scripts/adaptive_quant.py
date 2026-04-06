@@ -340,9 +340,10 @@ def _quantize_adaptive(flat_state: dict[str, mx.array], per_layer_mlp_bits: dict
     cat_bits = {}
     for name in flat_state:
         cat = _classify_param(name)
-        if cat == "attn":
+        base = cat.split(".")[0]  # "mlp.proj.5" → "mlp"; "attn.5" → "attn"
+        if base == "attn":
             cat_bits[name] = attn_bits
-        elif cat == "mlp":
+        elif base == "mlp":
             # Extract layer index from name like "blocks.5.mlp.fc.weight"
             parts = name.split(".")
             for i, p in enumerate(parts):
