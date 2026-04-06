@@ -1,8 +1,8 @@
 # Results Tracker
 
-All local (M4 Pro) training runs. All models use XSA (all layers), Partial RoPE 16/64, EMA 0.997, SWA every 50.
+Training runs on M4 Pro and Mac Studio M2 Max. All models use XSA (all layers), Partial RoPE 16/64, SWA every 50, lrelu2 unless noted.
 
-*Last updated: 2026-04-02*
+*Last updated: 2026-04-04*
 
 ## Leaderboard
 
@@ -83,6 +83,72 @@ All three runs used identical training budget: 7k steps × 16384 tokens/step = 1
 **13L/3x wins by 0.008 BPB despite 1.7M fewer params.** Same finding as 512d: at 640d, depth (more layers at 3x) beats MLP width (fewer layers at 4x) at iso-params. The extra 2 layers of processing are worth more than wider MLP.
 
 This confirms depth > MLP width holds across model dimensions. Both were run on Mac Studio M2 Max with identical training budget (7k steps, 70% warmdown, LR=0.02).
+
+### Multi-skip U-Net Experiments (2026-04-04)
+
+**Architecture:** Configurable encoder/decoder split via `NUM_ENCODER_LAYERS`. When encoder layers outnumber decoder layers, each decoder gets two skip connections (early + late encoder pair) instead of one. See `docs/evaluation_pipeline.md` and branch `experiments/multi-skip-unet`.
+
+**Token budget comparison (7k steps):**
+
+| Run | Arch | Params | Batch | Tokens | Float BPB | Post-quant | Pipeline | Machine |
+|-----|------|--------|-------|--------|-----------|------------|----------|---------|
+| 13L_640d_322_7k_wd70 | 13L/322/640d | 43.9M | 16384 | 114.7M | 1.3719 | 1.3723 | — | Mac Studio |
+| **13L_640d_322_7k_wd70_batch20k** | 13L/322/640d | 43.9M | 20480 | **143.4M** | **1.3474** | **1.3478** | — | Mac Studio |
+| 10L_640d_multiskip_7k_wd70 | 10L/322/640d multi-skip | 34.5M | 20480 | **143.4M** | 1.3703 | 1.3708 | — | Mac Studio |
+
+At matched tokens (143.4M), the 13L/322 baseline wins by **23 mBPB** over multi-skip (1.3478 vs 1.3708). The 9.4M extra params (27% more) are worth it at this token budget. However, multi-skip compresses to a smaller artifact (34.5M vs 43.9M params).
+
+The batch size difference (16384 vs 20480) is worth **24.5 mBPB** on the 322 architecture (1.3723 → 1.3478). This is significant — 25% more tokens per step × same steps = 25% more data seen.
+
+**Long run:**
+
+| Run | Arch | Params | Steps | Tokens | Float BPB | Post-quant | Pipeline | Machine |
+|-----|------|--------|-------|--------|-----------|------------|----------|---------|
+| **10L_640d_multiskip_22k_wd70** | 10L/322/640d multi-skip | 34.5M | 22k | 451M | **1.2974** | **1.2979** | **15.81 MB / 1.2933** | Mac Studio |
+
+Best result to date. Still improving at 22k (end slope ~-21 mBPB/1k steps).
+
+**Post-training pipeline (10L_640d_multiskip_22k_wd70):**
+
+Sensitivity analysis (real, after fixing the `mlp.N` cat_bits lookup bug — the on-branch `_classify_param` returned `mlp.fc.N`/`mlp.proj.N` but the walk-up chain never tried `mlp.N`, so per-layer MLP overrides were silently ignored):
+
+| Layer | attn int4 | mlp int4 | mlp int5 | mlp.fc int4 | mlp.proj int4 |
+|-------|-----------|----------|----------|-------------|----------------|
+| 0 | +0.0014 | +0.0049 | +0.0016 | +0.0020 | +0.0006 |
+| 1 | +0.0019 | +0.0043 | +0.0007 | +0.0017 | +0.0022 |
+| 2 | +0.0024 | +0.0040 | +0.0018 | +0.0014 | +0.0019 |
+| 3 | +0.0035 | +0.0044 | +0.0029 | +0.0015 | +0.0009 |
+| 4 | +0.0044 | +0.0038 | +0.0026 | +0.0007 | +0.0004 |
+| 5 | +0.0085 | +0.0041 | +0.0015 | +0.0015 | +0.0023 |
+| 6 | +0.0024 | +0.0039 | +0.0018 | +0.0024 | +0.0009 |
+| 7 | +0.0009 | +0.0039 | +0.0014 | +0.0012 | +0.0011 |
+| 8 | +0.0029 | +0.0061 | +0.0026 | +0.0012 | +0.0026 |
+| 9 | +0.0017 | +0.0012 | +0.0012 | +0.0000 | -0.0000 |
+
+L9 (0.5x mult, decoder-most layer) is essentially free at any bitwidth. mlp int5→int4 is generally cheaper per layer than attn int4→int3 demotion.
+
+**Allocation sweep (no polish):**
+
+| Config | Quant BPB | Gap | zpaq MB | Margin |
+|--------|-----------|-----|---------|--------|
+| attn:4, mlp:5 | 1.2913 | +0.0109 | 16.51 | -0.51 |
+| attn:4, mlp:5, mlp.4:4, mlp.9:3 | 1.2924 | +0.0120 | 16.07 | -0.07 |
+| **attn:4, mlp:5, mlp.3:4, mlp.4:4, mlp.9:3** | **1.2933** | **+0.0128** | **15.81** | **+0.19** |
+
+Best fit: **15.81 MB at 1.2933 BPB, score 20.45**.
+
+**Polish was a no-op** on this model. Ran 500 STE steps targeting the chosen allocation; resulting int values were byte-identical to the unpolished quantization for spot-checked layers (same range, same unique count, same Shannon entropy). Polish moved float weights but they rounded to the same grid points — the 22k-step model was already in a quant-friendly basin. Polish "succeeded" at driving quant gap to ~0 by moving float weights onto the grid, but the underlying float quality dropped by an equivalent amount and net BPB was unchanged.
+
+**Gradient accumulation test:**
+
+| Run | Batch | Accum | Eff. batch | Steps | Tokens | Post-quant | ms/step |
+|-----|-------|-------|-----------|-------|--------|------------|---------|
+| 10L_640d_multiskip_7k_wd70 | 20480 | 1 | 20480 | 7000 | 143.4M | 1.3708 | 1322 |
+| 10L_640d_multiskip_3500_wd70_2xaccum | 40960 | 2 | 40960 | 3500 | 143.4M | **1.3714** | 2520 |
+
+2x accumulation at matched tokens: **+0.6 mBPB (within noise)**. Smoother gradients (CV 7.1% vs 8.6%) did not translate to better final BPB. More optimizer steps (7k vs 3500) matter more than gradient quality at this batch size.
+
+**In progress:** `10L_640d_multiskip_7k_wd70_dense` — same as 7k multi-skip but with checkpoint_every=200 for loss variance analysis.
 
 ### 640d LR sweep (200 steps on workhorse)
 
