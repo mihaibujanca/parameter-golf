@@ -16,6 +16,7 @@ import argparse
 import math
 import os
 import pickle
+import re
 import sys
 import time
 from pathlib import Path
@@ -194,16 +195,24 @@ def quantize_configurable(
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
 
-        # Walk per_layer_bits fallback chain (most specific → least)
+        # Build lookup chain matching train_gpt_mlx.quantize_state_dict_int8.
+        # For "mlp.fc.N": try "mlp.fc.N" → "mlp.N" (whole-layer alias) → "mlp.fc" → "mlp".
+        keys_to_try = [cat]
+        m = re.match(r"mlp\.(fc|proj)\.(\d+)$", cat)
+        if m:
+            keys_to_try.append(f"mlp.{m.group(2)}")
+            keys_to_try.append("mlp.fc" if m.group(1) == "fc" else "mlp.proj")
+            keys_to_try.append("mlp")
+        else:
+            key = cat
+            while "." in key:
+                key = key.rsplit(".", 1)[0]
+                keys_to_try.append(key)
         bits = None
-        key = cat
-        while bits is None and key:
+        for key in keys_to_try:
             bits = (per_layer_bits or {}).get(key)
             if bits is not None:
                 break
-            if "." not in key:
-                break
-            key = key.rsplit(".", 1)[0]
         if bits is None:
             base_cat = cat.split(".")[0]
             if base_cat == "attn":
@@ -363,7 +372,7 @@ def main():
     )
 
     # Build model and load checkpoint
-    per_layer = [float(x) for x in hparams.mlp_mult_per_layer else None
+    per_layer = [float(x) for x in hparams.mlp_mult_per_layer.split(",") if x] if hparams.mlp_mult_per_layer else None
     model = GPT(
         vocab_size=hparams.vocab_size,
         num_layers=hparams.num_layers,

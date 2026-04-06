@@ -27,6 +27,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -342,15 +343,24 @@ def gptq_quantize_state_dict(flat_state: dict[str, mx.array],
 
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
+        # Build lookup chain matching train_gpt_mlx.quantize_state_dict_int8.
+        # For "mlp.fc.N": try "mlp.fc.N" → "mlp.N" (whole-layer alias) → "mlp.fc" → "mlp".
+        keys_to_try = [cat]
+        m = re.match(r"mlp\.(fc|proj)\.(\d+)$", cat)
+        if m:
+            keys_to_try.append(f"mlp.{m.group(2)}")
+            keys_to_try.append("mlp.fc" if m.group(1) == "fc" else "mlp.proj")
+            keys_to_try.append("mlp")
+        else:
+            key = cat
+            while "." in key:
+                key = key.rsplit(".", 1)[0]
+                keys_to_try.append(key)
         bits = None
-        key = cat
-        while bits is None and key:
+        for key in keys_to_try:
             bits = (cat_bits or {}).get(key)
             if bits is not None:
                 break
-            if "." not in key:
-                break
-            key = key.rsplit(".", 1)[0]
         if bits is None:
             bits = 8
         qmax = _BITS_TO_QMAX[bits]
