@@ -154,6 +154,16 @@ class Hyperparameters:
     quant_attn_bits: int = int(os.environ.get("QUANT_ATTN_BITS", "6"))
     quant_mlp_bits: int = int(os.environ.get("QUANT_MLP_BITS", "6"))
 
+    # Auxiliary encoder loss (deep supervision) — projects last encoder output
+    # through tied embeddings and adds its CE to main loss. 0.0 disables.
+    aux_loss_weight: float = float(os.environ.get("AUX_LOSS_WEIGHT", "0.0"))
+
+    # Continuation token loss upweighting. Tokens whose sentencepiece piece does
+    # not start with ▁ (i.e. subword continuations) get weight = this value,
+    # boundary tokens stay at 1.0, and weights are normalized so mean(w) = 1.
+    # 1.0 disables (uniform weighting, identical to unweighted mean).
+    continuation_loss_weight: float = float(os.environ.get("CONTINUATION_LOSS_WEIGHT", "1.0"))
+
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     @property
@@ -627,7 +637,8 @@ class GPT(nn.Module):
                  num_encoder_layers: int = 0, spelling_expert: bool = False,
                  spelling_expert_dim: int = 160, spelling_expert_window: int = 8,
                  spelling_expert_heads: int = 4, spelling_expert_kv_heads: int = 2,
-                 spelling_expert_mlp_mult: int = 2, spelling_expert_input: str = "encoder"):
+                 spelling_expert_mlp_mult: int = 2, spelling_expert_input: str = "encoder",
+                 aux_loss_weight: float = 0.0, token_loss_weights: mx.array | None = None):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -635,6 +646,14 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.logit_temp = logit_temp
         self.num_layers = num_layers
+        # aux_loss_weight is a plain Python float (not an mx.array) so MLX's
+        # tree_flatten does not treat it as model state.
+        object.__setattr__(self, 'aux_loss_weight', float(aux_loss_weight))
+        # token_loss_weights: shape (vocab_size,), mean 1.0. None disables weighting.
+        # Stored as a regular attribute (in model.state) so mx.compile can capture
+        # it, but SplitOptimizers filters 'token_loss_weights' out of trainable keys.
+        if token_loss_weights is not None:
+            self.token_loss_weights = token_loss_weights
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim) if bigram_vocab_size > 0 else None
@@ -739,7 +758,7 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, return_encoder_output: bool = False):
         x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -761,6 +780,9 @@ class GPT(nn.Module):
         if self.spelling_expert is not None:
             se_input = encoder_outputs[-1] if self.spelling_expert_input == "encoder" else x0
             x = x + self.spelling_expert(se_input)
+        if return_encoder_output:
+            # Last encoder output, before the decoder stack. Used for aux encoder loss.
+            return x, encoder_outputs[-1]
         return x
 
     def _apply_logit_processing(self, logits: mx.array) -> mx.array:
@@ -770,8 +792,9 @@ class GPT(nn.Module):
         return logits
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
+        # Pristine unweighted CE. This is the validation / BPB metric path —
+        # H1 (aux loss) and H2 (continuation weighting) must NOT pollute it.
+        # Training uses train_loss() below.
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
@@ -785,6 +808,58 @@ class GPT(nn.Module):
             logits = self._apply_logit_processing(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
+
+    def _mean_ce_weighted_or_plain(self, logits: mx.array, y: mx.array) -> mx.array:
+        # Uniform mean CE, or per-token weighted mean when token_loss_weights is set.
+        if getattr(self, "token_loss_weights", None) is None:
+            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+        ce = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+        w = self.token_loss_weights[y].astype(mx.float32)
+        return (ce * w).mean()
+
+    def _sum_ce_weighted_or_plain(self, logits: mx.array, y: mx.array) -> mx.array:
+        # Unnormalized sum of (ce * w) used by the logit-chunking path.
+        if getattr(self, "token_loss_weights", None) is None:
+            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="sum")
+        ce = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+        w = self.token_loss_weights[y].astype(mx.float32)
+        return (ce * w).sum()
+
+    def train_loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        # Training-time loss: adds H1 (aux encoder CE) and H2 (continuation token
+        # upweighting) on top of the standard CE. Defaults to identical output
+        # to loss() when aux_loss_weight == 0.0 and token_loss_weights is None.
+        aux_weight = float(getattr(self, "aux_loss_weight", 0.0))
+        if aux_weight > 0.0:
+            x_full, enc_out = self(input_ids, return_encoder_output=True)
+        else:
+            x_full = self(input_ids)
+            enc_out = None
+        dim = self.tok_emb.weight.shape[1]
+        x = x_full.reshape(-1, dim)
+        y = target_ids.reshape(-1)
+        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
+            logits = self._apply_logit_processing(x @ self.tok_emb.weight.astype(x.dtype).T)
+            main_loss = self._mean_ce_weighted_or_plain(logits, y)
+        else:
+            loss_sum = mx.array(0.0, dtype=mx.float32)
+            n = int(x.shape[0])
+            for s in range(0, n, self.logit_chunk_tokens):
+                e = min(s + self.logit_chunk_tokens, n)
+                logits = self._apply_logit_processing(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
+                loss_sum = loss_sum + self._sum_ce_weighted_or_plain(logits, y[s:e])
+            main_loss = loss_sum / float(n)
+
+        if aux_weight > 0.0:
+            # Deep supervision: project last encoder output through tied
+            # embeddings and add its CE. Same softcap/temp as the main head.
+            # Uses the same (possibly weighted) CE so both heads see the same
+            # per-token weighting.
+            e = rms_norm(enc_out).reshape(-1, dim)
+            aux_logits = self._apply_logit_processing(e @ self.tok_emb.weight.astype(e.dtype).T)
+            aux_loss = self._mean_ce_weighted_or_plain(aux_logits, y)
+            return main_loss + aux_weight * aux_loss
+        return main_loss
 
     def loss_last_n(self, input_ids: mx.array, target_ids: mx.array, n: int) -> mx.array:
         """Like loss() but scores only the last n tokens of each sequence. Used for sliding window eval."""
@@ -843,6 +918,10 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
+        # token_loss_weights is a constant LUT, not a learned parameter. It sits
+        # in model.state so mx.compile can capture it, but it must be excluded
+        # from every optimizer group.
+        params = {k: v for k, v in params.items() if "token_loss_weights" not in k}
         self.embed_keys = ["tok_emb.weight"]
         # BigramHash embed.weight uses the same Adam group as tok_emb
         if "bigram.embed.weight" in params:
@@ -875,6 +954,8 @@ class SplitOptimizers:
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
         params = dict(tree_flatten(model.parameters()))
+        # Keep token_loss_weights out of the update dict — it's a frozen LUT.
+        params = {k: v for k, v in params.items() if "token_loss_weights" not in k}
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
 
@@ -1435,6 +1516,9 @@ def main() -> None:
     # TRAINING SETUP
     # ==============================================================================
     mx.random.seed(args.seed)
+    # _init_weights uses np.random.randn for orthogonal init; seed it so comparable
+    # experiments (same SEED) start from identical weights.
+    np.random.seed(args.seed)
 
     skip_shards = _load_skip_shards()
     if skip_shards:
@@ -1448,6 +1532,21 @@ def main() -> None:
     per_layer = [float(x) for x in args.mlp_mult_per_layer.split(",") if x] if args.mlp_mult_per_layer else None
     if per_layer and len(per_layer) != args.num_layers:
         raise ValueError(f"MLP_MULT_PER_LAYER has {len(per_layer)} entries but NUM_LAYERS={args.num_layers}")
+
+    # H2: continuation token loss upweighting. A token is a "continuation" if
+    # its sentencepiece piece does NOT start with ▁ (leading space) AND it is
+    # not a special/boundary token. We build a mean-1 weight vector so overall
+    # loss magnitude stays comparable to the unweighted case.
+    token_loss_weights_mx: mx.array | None = None
+    if args.continuation_loss_weight != 1.0:
+        is_continuation_lut = (~has_leading_space_lut) & (~is_boundary_token_lut)
+        w_np = np.where(is_continuation_lut, args.continuation_loss_weight, 1.0).astype(np.float32)
+        # Normalize so mean over the vocab is 1.0. (Per-batch normalization would
+        # make the loss scale data-dependent; vocab-mean normalization keeps it
+        # static.)
+        w_np = w_np * (w_np.size / w_np.sum())
+        token_loss_weights_mx = mx.array(w_np, dtype=mx.float32)
+
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1476,7 +1575,13 @@ def main() -> None:
         spelling_expert_kv_heads=args.spelling_expert_kv_heads,
         spelling_expert_mlp_mult=args.spelling_expert_mlp_mult,
         spelling_expert_input=args.spelling_expert_input,
+        aux_loss_weight=args.aux_loss_weight,
+        token_loss_weights=token_loss_weights_mx,
     )
+    # token_loss_weights sits in model.state so mx.compile can capture it, but
+    # SplitOptimizers filters the name out of every optimizer group, so it is
+    # never updated. nn.value_and_grad produces a zero gradient for it (the LUT
+    # is only integer-indexed, never differentiated through), which is harmless.
     resume_ckpt = os.environ.get("RESUME_CHECKPOINT", "")
     if resume_ckpt:
         ckpt_state = dict(mx.load(resume_ckpt))
@@ -1493,8 +1598,11 @@ def main() -> None:
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    # Training uses model.train_loss, which adds aux encoder CE and continuation
+    # upweighting when enabled. model.loss stays unweighted so val_bpb is always
+    # the true CE metric regardless of the spelling experiments.
     compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        nn.value_and_grad(model, lambda x, y: model.train_loss(x, y)),
         inputs=model.state,
         outputs=model.state,
     )
@@ -1551,6 +1659,13 @@ def main() -> None:
     )
     log(f"unet enc:{model.num_encoder_layers} dec:{model.num_decoder_layers} skip_map:{model.skip_map} skip_weights:{model.skip_weights.shape[0]}")
     log(f"bigram:{args.bigram_vocab_size}x{args.bigram_dim} swa:{args.swa_enabled} muon_wd:{args.muon_wd} compressor:{_COMPRESSOR}")
+    if args.aux_loss_weight > 0.0 or args.continuation_loss_weight != 1.0:
+        n_cont = int(((~has_leading_space_lut) & (~is_boundary_token_lut)).sum())
+        log(
+            f"spelling_exp:aux_loss_weight={args.aux_loss_weight} "
+            f"continuation_loss_weight={args.continuation_loss_weight} "
+            f"n_continuation_tokens={n_cont}/{args.vocab_size}"
+        )
 
     # ==============================================================================
     # TRAINING LOOP
