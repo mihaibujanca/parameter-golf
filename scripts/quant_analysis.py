@@ -55,10 +55,21 @@ def per_layer_sensitivity(
 
     for i in range(num_layers):
         for comp in ['attn', 'mlp', 'both']:
+            # _classify_param returns 'mlp.fc.N' / 'mlp.proj.N' / 'attn.N'.
+            # The walk-up chain never tries 'mlp.N', so we expand it explicitly.
             if comp == 'both':
-                cat_bits = {f'attn.{i}': target_bits, f'mlp.{i}': target_bits}
-            else:
-                cat_bits = {f'{comp}.{i}': target_bits}
+                cat_bits = {
+                    f'attn.{i}': target_bits,
+                    f'mlp.fc.{i}': target_bits,
+                    f'mlp.proj.{i}': target_bits,
+                }
+            elif comp == 'mlp':
+                cat_bits = {
+                    f'mlp.fc.{i}': target_bits,
+                    f'mlp.proj.{i}': target_bits,
+                }
+            else:  # 'attn'
+                cat_bits = {f'attn.{i}': target_bits}
             qobj, _ = quantize_state_dict_int8(flat_state, cat_bits=cat_bits)
             qflat = dequantize_state_dict_int8(qobj)
             model.update(tree_unflatten(list(qflat.items())))
@@ -133,20 +144,24 @@ def compound_error_profile(
         x0 = model.smear(rms_norm(tok_emb))
         h = x0
         n_enc = model.num_encoder_layers
-        encoder_outputs = []
+        encoder_outputs = [None] * n_enc
+        skip_map = model.skip_map
+        flat_skip_idx = 0
         hidden = {}
         for i, block in enumerate(model.blocks):
-            if i >= n_enc and (i - n_enc) < model.num_skip_weights:
-                skip_idx = n_enc - 1 - (i - n_enc)
-                w = model.skip_weights[i - n_enc]
-                h = h + w.astype(h.dtype)[None, None, :] * encoder_outputs[skip_idx]
+            if i >= n_enc:
+                dec_idx = i - n_enc
+                for enc_i in skip_map[dec_idx]:
+                    w = model.skip_weights[flat_skip_idx]
+                    h = h + w.astype(h.dtype)[None, None, :] * encoder_outputs[enc_i]
+                    flat_skip_idx += 1
             mix = block.resid_mix.astype(h.dtype)
             h = mix[0][None, None, :] * h + mix[1][None, None, :] * x0
             attn_out = block.attn(block.attn_norm(h))
             h = h + block.attn_scale.astype(h.dtype)[None, None, :] * attn_out
             h = h + block.mlp_scale.astype(h.dtype)[None, None, :] * block.mlp(block.mlp_norm(h), slope=block.lrelu_slope)
             if i < n_enc:
-                encoder_outputs.append(h)
+                encoder_outputs[i] = h
             mx.eval(h)
             hidden[i] = h
         return hidden
