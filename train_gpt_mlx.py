@@ -1020,18 +1020,27 @@ _QUANT_FN = {2: quantize_int2_per_row, 3: quantize_int3_per_row, 4: quantize_int
 
 
 def _classify_param(name: str) -> str:
-    """Classify parameter for quantization. Returns category string.
+    """Classify parameter for quantization. Returns the most specific category.
 
-    For per-layer bit-width overrides, also returns 'mlp.N' or 'attn.N'
-    which cat_bits can match before falling back to 'mlp' or 'attn'.
+    Returns:
+      - "mlp.proj.12" for "blocks.12.mlp.proj.weight"
+      - "mlp.fc.12" for "blocks.12.mlp.fc.weight"
+      - "attn.12" for "blocks.12.attn.c_q.weight"
+    The cat_bits fallback chain (in quantize_state_dict_int8) goes:
+      "mlp.proj.12" → "mlp.proj" → "mlp"
+      "attn.12" → "attn"
     """
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    # Extract layer index for per-layer overrides (e.g. "blocks.12.mlp.fc.weight")
     import re
-    m = re.search(r"blocks\.(\d+)\.(mlp|attn)\.", name)
+    # MLP with sub-component (fc / proj) + layer
+    m = re.search(r"blocks\.(\d+)\.mlp\.(fc|proj)\.", name)
     if m:
-        return f"{m.group(2)}.{m.group(1)}"  # e.g. "mlp.12"
+        return f"mlp.{m.group(2)}.{m.group(1)}"  # e.g. "mlp.proj.12"
+    # Attention + layer
+    m = re.search(r"blocks\.(\d+)\.attn\.", name)
+    if m:
+        return f"attn.{m.group(1)}"  # e.g. "attn.12"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name:
@@ -1086,13 +1095,20 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array], int6_cats: set[str
 
         stats["num_float_tensors"] += 1
         cat = _classify_param(name)
-        # Per-layer override (e.g. "mlp.12") falls back to category (e.g. "mlp")
-        bits = (cat_bits or {}).get(cat)
+        # Walk cat_bits fallback chain from most specific to least.
+        # e.g. "mlp.proj.12" → "mlp.proj" → "mlp"; "attn.12" → "attn"
+        bits = None
+        key = cat
+        while bits is None and key:
+            bits = (cat_bits or {}).get(key)
+            if bits is not None:
+                break
+            if "." not in key:
+                break
+            key = key.rsplit(".", 1)[0]
         if bits is None:
-            base_cat = cat.split(".")[0]  # "mlp.12" -> "mlp"
-            bits = (cat_bits or {}).get(base_cat)
-        if bits is None:
-            bits = 6 if cat in int6_cats else 8
+            base_cat = cat.split(".")[0]
+            bits = 6 if base_cat in int6_cats else 8
         quant_fn = _QUANT_FN[bits]
         q, s = quant_fn(arr)
         if bits < 8:
